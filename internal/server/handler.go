@@ -628,6 +628,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// fullWaitBudget 并发占满时的等待预算：每轮 150ms，最多 200 轮（约 30s）。
+	// 超出预算仍无名额才回 503，避免极端情况下无限等待拖死客户端。
+	// 预算取值依据：单账号并发槽位有限（global 默认 4），Codex 一次任务可能并行
+	// 发十几个请求；每个请求数秒，排队尾部的等待可达十几秒，预算过小会把本可
+	// 完成的请求判成 503（表现为对话中途断线）。
+	fullWaitBudget := 200
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -644,6 +650,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
+			// 区分「真的没号」与「号只是被并发占满」：后者在 Codex 多请求并发下
+			// 很常见，短暂等待名额释放后重试即可，直接 503 会表现为对话中途断线。
+			if h.cfg.Pool.HealthyButFull(bareModel, realm) {
+				if fullWaitBudget <= 0 {
+					st.status = http.StatusServiceUnavailable
+					break
+				}
+				fullWaitBudget--
+				select {
+				case <-time.After(150 * time.Millisecond):
+					// 重试本轮选号（不计入 tried，不消耗轮换次数）。
+					i--
+					continue
+				case <-r.Context().Done():
+					st.status = http.StatusServiceUnavailable
+					break
+				}
+			}
 			st.status = http.StatusServiceUnavailable
 			break
 		}

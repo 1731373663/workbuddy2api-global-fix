@@ -358,6 +358,39 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态现实中不可达
 // （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
 // 不构成 chat 选号路径。
+// HealthyButFull 报告是否存在「状态健康、只是并发名额被占满」的账号。
+//
+// 用途：handler 区分两种“选不到号”——
+//   - false：真的没有可用账号（冷却/禁用），应立即返回 503；
+//   - true ：账号只是被并发占满，短暂等待名额释放即可继续，不该直接失败。
+// 并发突发的 Codex 多请求场景下，后者占绝大多数，直接 503 会表现为“中途断线”。
+// realm 非空时只统计该域；model 非空时按模型级冷却豁免口径判定。
+func (p *Pool) HealthyButFull(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !p.inFlightFull(e) {
+			continue // 未占满的账号 Pick 本身就能选到，不属于本情形
+		}
+		healthy := e.healthy(now)
+		if model != "" {
+			healthy = e.healthyForModel(now, model)
+		}
+		if healthy || e.modelExempt() {
+			return true
+		}
+	}
+	return false
+}
+
+
 func (p *Pool) ServableNow() bool {
 	return p.servableLocked("")
 }
