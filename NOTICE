@@ -18,6 +18,9 @@ Modification in this repository:
     display per-model request statistics.
   - Keep the complete dual-realm model catalog (cn:/global: prefixes) from
     the upstream project instead of truncating it to a CLI allow-list.
+  - Add an OpenAI Responses API compatibility layer (`POST /v1/responses`)
+    that translates requests to Chat Completions and emits the semantic
+    streaming events Codex expects.
   - Preserve the original MIT license and upstream copyright notice.
 
 No credentials, auths/, data/, local configuration, account identifiers,

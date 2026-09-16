@@ -13,6 +13,7 @@
 >   1. 定时签到、猫猫旅行等国内活动跳过国际版（`workbuddy.ai`）账号，避免无效调用触发熔断；
 >   2. 移植 `/v1/stats` 请求统计接口，兼容 workbuddy2api-gui 管理面板；
 >   3. 保留原作者最新版的完整双域模型目录（`cn:` / `global:` 前缀），不再截断为 CLI 白名单子集。
+>   4. 增加 OpenAI Responses API 兼容层（`POST /v1/responses`）：内部翻译为 Chat Completions，并输出 Codex 需要的语义化流式事件。
 >
 > 本仓库仅用于学习、研究和个人授权账号的私有环境测试。
 

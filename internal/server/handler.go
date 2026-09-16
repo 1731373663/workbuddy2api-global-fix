@@ -104,6 +104,10 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// OpenAI Responses API 兼容层（Codex 等客户端默认走 /v1/responses）：
+	// 内部翻译成 Chat Completions，复用同一套选号/轮转/统计链路。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("GET /v1/responses/{id}", h.withAuth(h.responsesGet))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
