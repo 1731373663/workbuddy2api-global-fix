@@ -4,24 +4,41 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server
+# 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
 
 FROM alpine:3.20
-RUN apk add --no-cache wget ca-certificates tzdata \
+# python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
-USER app
 WORKDIR /app
+# 脚本置入 + 去 CRLF（Windows 检出可能性）在切到 app 之前以 root 完成——
+# app 对 root 所有文件无写权限，sed -i 需要写权限。
 COPY --from=build /out/wb2api /app/wb2api
+COPY --from=build /out/signin_bin /app/signin_bin
+COPY --from=build /out/login /app/login
+COPY --from=build /out/credit /app/credit
+COPY --from=build /out/trial_bin /app/trial_bin
+COPY --from=build /out/activity_bin /app/activity_bin
+COPY login.sh signin.sh credit.sh trial.sh /app/
+# 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
+COPY scripts/global_region.py /app/scripts/global_region.py
+COPY scripts/task_common.py /app/scripts/task_common.py
+COPY scripts/task_runner.py /app/scripts/task_runner.py
+COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
+RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
+RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
+# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.json
+USER app
 EXPOSE 7863
-# 健康检查端口：从 config.json 的 listen 字段实时解析，避免写死端口。
-#
-# 为什么不能写死：网关支持自定义监听端口（如本机用 7864 与旧实例并存），
-# 而 HEALTHCHECK 是镜像构建期固化的。写死 7863 会导致换端口部署时探活永远失败
-# （容器显示 unhealthy，但服务其实正常）——这会误导编排/负载均衡摘流量。
-# 这里用 sed 从 /app/config.json 提取 listen 的端口号；解析失败则回落 7863。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-  CMD sh -c 'p=$(sed -n "s/.*\"listen\"[[:space:]]*:[[:space:]]*\"[^\"]*:\([0-9]\+\).*/\1/p" /app/config.json | head -1); [ -z "$p" ] && p=7863; wget -qO- "http://127.0.0.1:$p/healthz" || exit 1'
+  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
 ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]

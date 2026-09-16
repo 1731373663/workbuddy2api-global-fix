@@ -1,17 +1,24 @@
-// login.go — WorkBuddy OAuth login (CN + GLOBAL realms).
+// login.go — WorkBuddy OAuth 登录（设备授权流程，CN realm；--realm=global 供国际版）。
 //
-// Based on upstream Sliverkiss/workbuddy2api cmd/login (CN only), extended with
-// the GLOBAL realm (workbuddy.ai) — same /v2/plugin/* endpoints, different base:
+// 两个子命令，由 login.sh 顺序驱动：
 //
-//	login url [cn|global]   → POST {base}/v2/plugin/auth/state?platform=CLI
-//	login poll [cn|global]  → GET {base}/v2/plugin/auth/token?state=
+//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
+//	                                  state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
+//	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
+//	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
+//	                                  stdout 打印完整 token+account JSON（含 realm 键）
 //
-// Global base/origin per Maquer/workbuddy-checkin login.sh:
+// --realm 默认 cn。按 realm 切换上游端点与 Origin/Referer：
 //
-//	GLOBAL_AUTH_BASE = https://www.workbuddy.ai (same path layout as CN)
+//	cn     → https://copilot.tencent.com（Origin: https://www.codebuddy.cn）
+//	global → https://www.workbuddy.ai（Origin: https://www.workbuddy.ai）
+//
+// state 落盘带 realm，poll 读回校验与命令行 --realm 一致（防混域）。
+// 无 PKCE（workbuddy 设备流由服务端签发 state）。
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -22,64 +29,39 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	auth2 "workbuddy2api/internal/auth"
 )
 
+// 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
+// （base 与 Origin/Referer 同域）。端点 URL 由 realmConfig 按 realm 动态拼出，不再硬编码。
 const (
-	upstreamBaseCN     = "https://copilot.tencent.com"
-	upstreamBaseGlobal = "https://www.workbuddy.ai"
-	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originCN           = "https://www.codebuddy.cn"
-	originGlobal       = "https://www.workbuddy.ai"
-
-	// stateFileNameCN/Global 设备授权的 state 文件名（按 region 分开，避免
-	// 同时开两个 region 的登录流程时互相覆盖）。
-	stateFileNameCN     = "wb2api-login-state-cn.json"
-	stateFileNameGlobal = "wb2api-login-state-global.json"
+	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseGlobal  = "https://www.workbuddy.ai"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
-// stateDir 返回 state 文件所在目录，并确保目录存在。
-//
-// 为什么不硬编码绝对路径：原实现写死 `/tmp/...`，在 Windows 上不可用（PR 作者
-// 的动机）；而 PR 改成写死 `C:/Users/Administrator/Desktop/Mod/...` 又反过来在
-// Linux/macOS 上不可用（该路径不存在，会直接 fatal）。
-// 这里用 os.TempDir()（Linux → /tmp，Windows → %TEMP%），两端都成立；
-// 允许用 WB2A_STATE_DIR 环境变量覆盖，便于把 state 放到指定目录。
-func stateDir() string {
-	dir := os.Getenv("WB2A_STATE_DIR")
-	if dir == "" {
-		dir = os.TempDir()
+// 登录 state 落盘路径（var 便于测试替换临时文件）。
+// 跨平台：os.TempDir() 在 Linux 解析为 /tmp（容器内行为不变），Windows 解析为
+// 系统临时目录，避免硬编码 /tmp 在 Windows 上 "The system cannot find the path"。
+var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
+
+// exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
+var exitFunc = os.Exit
+
+// realmConfig 按 realm 返回上游 base 与 Origin/Referer origin：global →
+// (www.workbuddy.ai, www.workbuddy.ai)；cn/非法/缺省 → (copilot.tencent.com, codebuddy.cn)。
+func realmConfig(realm string) (base, origin string) {
+	if realm == realmGlobal {
+		return upstreamBaseGlobal, originRefererGlobal
 	}
-	// 目录不存在时尝试创建；失败则回落临时目录（写文件时会给出真实错误）。
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return os.TempDir()
-	}
-	return dir
+	return upstreamBaseCN, originRefererCN
 }
 
-// region 规范化：接受 cn/global，大小写与空白容错，非法值报错。
-//
-// 默认 CN（注意：上游 PR 的默认是 global）。原因：login.sh 以 `login url`
-// （不带参数）调用本工具，若默认改成 global，现有 CN 用户跑一次 ./login.sh
-// 就会静默切到另一个 realm，登录的账号体系完全不同。故保持 CN 为默认，
-// 确保既有流程行为零变化；需要 Global 时显式传 `global`。
-func normalizeRegion(s string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "cn":
-		return "cn", nil
-	case "global":
-		return "global", nil
-	default:
-		return "", fmt.Errorf("unknown region %q (want cn|global)", s)
-	}
-}
-
-func bases(region string) (base, origin, stateFile string) {
-	if region == "global" {
-		return upstreamBaseGlobal, originGlobal, filepath.Join(stateDir(), stateFileNameGlobal)
-	}
-	return upstreamBaseCN, originCN, filepath.Join(stateDir(), stateFileNameCN)
-}
-
+// commonHeaders 按 origin 设置通用请求头（Origin/Referer 随 realm 变化）。
+// 返回 func(*http.Request)，由调用方按 realm 选定的 origin 构造一次后复用。
 func commonHeaders(origin string) func(*http.Request) {
 	return func(req *http.Request) {
 		req.Header.Set("Content-Type", "application/json")
@@ -91,12 +73,14 @@ func commonHeaders(origin string) func(*http.Request) {
 	}
 }
 
+// apiEnvelope 上游 {code,msg,data} 业务信封（与 upstream doJSON 家族解析口径一致）。
 type apiEnvelope struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
 
+// doJSON 与 upstream.doJSON 语义一致：{code,msg,data} 信封，code!=0 → error
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -104,13 +88,20 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	}
 	if headers != nil {
 		headers(req)
+	} else {
+		// 缺省头：CN origin（与原 commonHeaders() 行为一致，零回归）
+		commonHeaders(originRefererCN)(req)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进 Unmarshal（避免误报 parse failed）。
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
 	}
@@ -129,114 +120,220 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "login: "+format+"\n", args...)
-	os.Exit(1)
+	exitFunc(1)
 }
 
 type loginState struct {
 	State string `json:"state"`
+	Realm string `json:"realm,omitempty"` // url 落盘时写回的 realm，poll 读回校验防混域
+}
+
+// realm 取值枚举（与 internal/auth 的 Realm() 归一化输出一致）。
+const (
+	realmCN     = "cn"
+	realmGlobal = "global"
+)
+
+// parseRealmArgs 解析开头的 --realm=cn|global（或分离式 --realm <v>）flag，缺省 cn。
+// 大小写不敏感归一化；非法值/缺值报错。桌椅剩余参数（子命令）顺序不变。
+func parseRealmArgs(args []string) (realm string, rest []string, err error) {
+	realm = realmCN
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--realm":
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--realm requires a value")
+			}
+			v := strings.ToLower(strings.TrimSpace(args[i+1]))
+			if v != realmCN && v != realmGlobal {
+				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", args[i+1])
+			}
+			realm = v
+			i++
+		case strings.HasPrefix(a, "--realm="):
+			v := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(a, "--realm=")))
+			if v != realmCN && v != realmGlobal {
+				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", v)
+			}
+			realm = v
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return realm, rest, nil
+}
+
+// resolveRealmInput 把交互式选域的一行输入归一化为 realm（纯函数，login.sh 交互分支
+// 的核心决策，可测）。规则：
+//
+//	"1"/"cn"（大小写不敏感）/""（回车默认）→ cn
+//	"2"/"global" → global
+//	其他 → ("", false)（调用方回默认 cn）
+func resolveRealmInput(input string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "", "1", "cn":
+		return realmCN, true
+	case "2", "global":
+		return realmGlobal, true
+	}
+	return "", false
+}
+
+// promptRealm 交互式选域：向 out 打印选项提示（out 接 stderr，stdout 留给 realm 本身），
+// 从 in 读一行，返回归一化 realm。非法输入警告后回落 cn；EOF（非交互/管道）回落 cn。
+func promptRealm(in io.Reader, out io.Writer) string {
+	fmt.Fprintln(out, "选择登录版本: 1) 国内版(cn) 2) 国际版(global) [默认 1/cn]: ")
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && line == "" {
+		// EOF/非交互 → 回落默认 cn
+		return realmCN
+	}
+	if realm, ok := resolveRealmInput(line); ok {
+		return realm
+	}
+	fmt.Fprintln(out, "无效选择，默认国内版 cn")
+	return realmCN
+}
+
+// validateRealmMatch 校验 state 文件 realm 与命令行 --realm 一致（防混域）：
+// state 无 realm（旧文件）放行；非空且不一致 → error。
+func validateRealmMatch(stateRealm, cliRealm string) error {
+	if stateRealm != "" && stateRealm != cliRealm {
+		return fmt.Errorf("realm mismatch: state file realm=%q, command --realm=%q（url 与 poll 需同一 realm）", stateRealm, cliRealm)
+	}
+	return nil
+}
+
+// runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
+// state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
+// （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
+func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
+	headers := commonHeaders(origin)
+	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		fatal("auth state failed: %v", err)
+	}
+	var st struct {
+		State   string `json:"state"`
+		AuthURL string `json:"authUrl"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
+		fatal("auth state: missing state or authUrl")
+	}
+	raw, _ := json.Marshal(loginState{State: st.State, Realm: realm})
+	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+		fatal("write state: %v", err)
+	}
+	fmt.Fprintln(out, st.AuthURL)
+}
+
+// runPoll 执行 poll 子命令：读 state 文件（realm 校验），向 upstreamBase 的 token 端点
+// GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
+// statePath 可注入临时文件便于测试。
+func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		fatal("read state: %v (先跑 login url)", err)
+	}
+	var ls loginState
+	if err := json.Unmarshal(raw, &ls); err != nil {
+		fatal("parse state: %v", err)
+	}
+	// 防混域：state 落盘 realm 与命令行 --realm 不一致则拒绝（url 与 poll 必须同域）
+	if err := validateRealmMatch(ls.Realm, realm); err != nil {
+		fatal("%v", err)
+	}
+	headers := commonHeaders(origin)
+	// handlePollLogin：auth/token 是权威登录状态端点，
+	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
+	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
+	if errTok != nil {
+		if status == 0 || status >= 500 {
+			fatal("token endpoint error: %v", errTok)
+		}
+		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	}
+	// login/account 拿 uid/nickname（带 Bearer）
+	var acct struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}
+	acctHeaders := func(r *http.Request) {
+		headers(r)
+		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	}
+	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+ls.State, acctHeaders, nil); errAcct == nil {
+		_ = json.Unmarshal(acctRaw, &acct)
+	}
+	oraw, _ := json.Marshal(buildLoginOutput(tok, realm, acct))
+	fmt.Fprintln(out, string(oraw))
+	os.Remove(statePath)
+}
+
+// buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。
+// realm 永不空：显式 --realm 优先（ResolveRealm 处理），否则按上游返回的 domain 推断——
+// 保证登录落盘的 auth 文件恒带 realm 键。
+func buildLoginOutput(tok struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}, realm string, acct struct {
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterpriseId"`
+	Nickname     string `json:"nickname"`
+}) map[string]any {
+	return map[string]any{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+		"expires_in":    tok.ExpiresIn,
+		"domain":        tok.Domain,
+		"realm":         auth2.ResolveRealm(realm, tok.Domain),
+		"uid":           acct.UID,
+		"enterprise_id": acct.EnterpriseID,
+		"nickname":      acct.Nickname,
+	}
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll> [cn|global] (default cn)")
-	}
-	sub := os.Args[1]
-	// 缺省 CN：保证 login.sh 的既有调用（login url / login poll）行为不变。
-	// 要用 Global realm 请显式传第二个参数（./login.sh global）。
-	regionArg := "cn"
-	if len(os.Args) >= 3 {
-		regionArg = os.Args[2]
-	}
-	region, err := normalizeRegion(regionArg)
+	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
-		fatal("%v", err)
+		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
 	}
-	base, origin, stateFile := bases(region)
-
+	if len(rest) < 1 {
+		fatal("usage: login [--realm=cn|global] <url|poll>")
+	}
+	// 每个流程独立 cookie jar（多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 
-	switch sub {
+	base, origin := realmConfig(realm)
+
+	switch rest[0] {
 	case "url":
-		h := commonHeaders(origin)
-		data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", h, bytes.NewReader([]byte("{}")))
-		if err != nil {
-			fatal("auth state failed: %v", err)
-		}
-		var st struct {
-			State   string `json:"state"`
-			AuthURL string `json:"authUrl"`
-		}
-		if err := json.Unmarshal(data, &st); err != nil || st.State == "" {
-			fatal("auth state: missing state (authUrl may be region-local login page)")
-		}
-		raw, _ := json.Marshal(loginState{State: st.State})
-		if err := os.WriteFile(stateFile, raw, 0o600); err != nil {
-			fatal("write state: %v", err)
-		}
-		// Upstream returns authUrl for CN sometimes empty on global; build fallback.
-		url := st.AuthURL
-		if url == "" {
-			url = base + "/login?state=" + st.State + "&platform=CLI"
-		}
-		fmt.Println(url)
+		runURL(base, origin, realm, stateFile, client, os.Stdout)
 
 	case "poll":
-		raw, err := os.ReadFile(stateFile)
-		if err != nil {
-			fatal("read state: %v (run `login url %s` first)", err, region)
-		}
-		var ls loginState
-		if err := json.Unmarshal(raw, &ls); err != nil {
-			fatal("parse state: %v", err)
-		}
-		h := commonHeaders(origin)
-		tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, h, nil)
-		if errTok != nil {
-			if status == 0 || status >= 500 {
-				fatal("token endpoint error: %v", errTok)
-			}
-			fatal("login not completed yet. Finish browser login first, then re-run `login poll %s`", region)
-		}
-		var tok struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresIn    int64  `json:"expiresIn"`
-			Domain       string `json:"domain"`
-		}
-		if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-			fatal("login not completed yet. Finish browser login first, then re-run `login poll %s`", region)
-		}
-		acctHeaders := func(r *http.Request) {
-			h(r)
-			r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-		}
-		var acct struct {
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-		}
-		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+ls.State, acctHeaders, nil); errAcct == nil {
-			_ = json.Unmarshal(acctRaw, &acct)
-		}
-		if tok.Domain == "" && region == "global" {
-			tok.Domain = "www.workbuddy.ai"
-		}
-		out := map[string]any{
-			"access_token":  tok.AccessToken,
-			"refresh_token": tok.RefreshToken,
-			"expires_in":    tok.ExpiresIn,
-			"domain":        tok.Domain,
-			"uid":           acct.UID,
-			"enterprise_id": acct.EnterpriseID,
-			"nickname":      acct.Nickname,
-			"region":        region,
-		}
-		oraw, _ := json.Marshal(out)
-		fmt.Println(string(oraw))
-		os.Remove(stateFile)
+		runPoll(base, origin, realm, stateFile, client, os.Stdout)
+
+	case "realm":
+		// 交互式选域（login.sh 无 --realm 传参且 stdin 为 tty 时调用）。
+		// 提示打到 stderr，stdout 只输出归一化 realm，供 $( ) 捕获。
+		realm := promptRealm(os.Stdin, os.Stderr)
+		fmt.Println(realm)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll [cn|global])", sub)
+		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
 	}
 }

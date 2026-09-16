@@ -1,10 +1,11 @@
 # Auth & secrets
 auths/
 data/
-# 多实例部署时的额外数据目录（含 state.json 账号状态，不入库）
-data-*/
 *.key
 *.pem
+*.env
+.env
+.env.*
 
 # Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
 /login

@@ -14,6 +14,10 @@ Community enhanced branch used as a source reference:
 Modification in this repository:
   - Skip CN-only scheduled activities (daily check-in and cat travel) for
     Global accounts whose auth domain is workbuddy.ai or a subdomain.
+  - Port the /v1/stats request metrics endpoint so workbuddy2api-gui can
+    display per-model request statistics.
+  - Keep the complete dual-realm model catalog (cn:/global: prefixes) from
+    the upstream project instead of truncating it to a CLI allow-list.
   - Preserve the original MIT license and upstream copyright notice.
 
 No credentials, auths/, data/, local configuration, account identifiers,

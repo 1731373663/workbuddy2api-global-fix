@@ -26,7 +26,7 @@ func BenchmarkPick46Accounts(b *testing.B) {
 	p := benchPool(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.Pick()
+		p.Pick("")
 	}
 }
 

@@ -148,6 +148,234 @@ data: [DONE]
 	}
 }
 
+// TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
+// name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
+func TestStripToolCallNames(t *testing.T) {
+	mkFrame := func(idx float64, name, args string) map[string]any {
+		fn := map[string]any{}
+		if name != "" {
+			fn["name"] = name
+		}
+		if args != "" {
+			fn["arguments"] = args
+		}
+		return map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"index": idx, "function": fn},
+			}}},
+		}}
+	}
+	getFn := func(f map[string]any) map[string]any {
+		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	}
+	seen := map[int]bool{}
+
+	// 首片带 name：保留，seen 建立
+	f0 := mkFrame(0, "lookup", "")
+	stripToolCallNames(f0, seen)
+	if !seen[0] {
+		t.Fatal("index 0 should be marked seen after first chunk")
+	}
+	if getFn(f0)["name"] != "lookup" {
+		t.Errorf("first chunk name=%v want lookup", getFn(f0)["name"])
+	}
+
+	// 后续 chunk name 为空串：删除 name 键
+	f1 := mkFrame(0, "", `{"term":"x"}`)
+	stripToolCallNames(f1, seen)
+	if _, ok := getFn(f1)["name"]; ok {
+		t.Errorf("subsequent empty name should be stripped: %#v", getFn(f1))
+	}
+	if getFn(f1)["arguments"] != `{"term":"x"}` {
+		t.Errorf("arguments altered: %#v", getFn(f1)["arguments"])
+	}
+
+	// 后续 chunk 重复非空 name（上游噪声）：同样删除，arguments 原样
+	f2 := mkFrame(0, "lookup", "y")
+	stripToolCallNames(f2, seen)
+	if _, ok := getFn(f2)["name"]; ok {
+		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", getFn(f2))
+	}
+	if getFn(f2)["arguments"] != "y" {
+		t.Errorf("arguments altered: %#v", getFn(f2)["arguments"])
+	}
+
+	// 不同 index 互不串扰：index 1 首片保留 name
+	f3 := mkFrame(1, "other", "")
+	stripToolCallNames(f3, seen)
+	if getFn(f3)["name"] != "other" {
+		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
+	}
+	if !seen[1] {
+		t.Error("index 1 should be marked seen")
+	}
+
+	// 非 tool_calls 帧（content only）零影响
+	f4 := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"content": "hi"}},
+	}}
+	stripToolCallNames(f4, seen)
+	if got := f4["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
+		t.Errorf("content-only frame altered: %#v", got)
+	}
+}
+
+// TestStreamToolCallNameOnce 11 帧 tool_call：首帧 name=Bash，后续 10 帧不得携带
+// name 键，arguments 逐帧原样透传（issue #82：累加型客户端把每个分片 name 拼接成
+// Bash×帧数；正确行为是 name 只在首帧出现一次）。
+func TestStreamToolCallNameOnce(t *testing.T) {
+	const nFrames = 11
+	var sb strings.Builder
+	for i := 0; i < nFrames; i++ {
+		sb.WriteString(`data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"arg` + string(rune('0'+i)) + `"}}]}}]}`)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+
+	frames, done := streamFrames(t, sb.String())
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != nFrames {
+		t.Fatalf("frames=%d want %d", len(frames), nFrames)
+	}
+	gotName := 0
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		if len(tcs) != 1 {
+			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
+		}
+		fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+		if _, ok := fn["name"]; ok {
+			gotName++
+			if i != 0 || fn["name"] != "Bash" {
+				t.Errorf("frame %d unexpected name=%v (name 只能出现在首帧且为 Bash)", i, fn["name"])
+			}
+		}
+		if want := "arg" + string(rune('0'+i)); fn["arguments"] != want {
+			t.Errorf("frame %d arguments=%v want %q", i, fn["arguments"], want)
+		}
+	}
+	if gotName != 1 {
+		t.Errorf("name 出现帧数=%d want 1", gotName)
+	}
+}
+
+// TestStreamToolCallParallelFragments 多 tool_call（index 0 与 1 并行分片交错下发）：
+// 每个 index 只保留自己的首帧 name，后续分片互不串扰、arguments 各自原样。
+func TestStreamToolCallParallelFragments(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"a0\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"a1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+
+	argByIndex := map[int]string{}
+	nameCount := map[int]int{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			if _, ok := fn["name"]; ok {
+				nameCount[idx]++
+			}
+			if a, _ := fn["arguments"].(string); a != "" {
+				argByIndex[idx] = a
+			}
+		}
+	}
+	// 每个 index 恰好出现一次 name，arguments 逐片原样（a0/a1 各自保留）
+	if nameCount[0] != 1 || nameCount[1] != 1 {
+		t.Errorf("name 出现次数 index0=%d index1=%d，各 want 1", nameCount[0], nameCount[1])
+	}
+	if argByIndex[0] != "a0" || argByIndex[1] != "a1" {
+		t.Errorf("arguments index0=%q index1=%q want a0/a1", argByIndex[0], argByIndex[1])
+	}
+}
+
+// TestStreamToolCallNoiseEmptyName 上游后续帧带空串 name（噪声形态）→ 输出帧无 name 键。
+// 键缺失是比空串更安全的形态，客户端「键缺失则保留旧值」不会清空工具名。
+func TestStreamToolCallNoiseEmptyName(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg2\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			if i == 0 {
+				if fn["name"] != "lookup" {
+					t.Errorf("frame 0 name=%v want lookup", fn["name"])
+				}
+				continue
+			}
+			if _, ok := fn["name"]; ok {
+				t.Errorf("frame %d: 空串 name 应被剥离为键缺失, got %#v", i, fn)
+			}
+		}
+	}
+}
+
+// TestStreamToolCallOverwriteClientSemantics 覆盖型语义验证：模拟「键缺失则保留旧值」
+// 的覆盖型客户端（name ?? state.name / if (name) state.name = name），在输出流上逐帧
+// 重建 name，最终必须收敛为 Bash——证明键缺失形态不会清空工具名。
+func TestStreamToolCallOverwriteClientSemantics(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	state := map[int]string{}
+	reconstructed := map[int]string{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			// 覆盖型语义：键缺失 → ?? 保留旧值；非空 name → 覆盖。
+			if name, ok := fn["name"]; ok {
+				state[idx] = name.(string)
+			}
+			if state[idx] != "" {
+				reconstructed[idx] = state[idx]
+			}
+		}
+	}
+	// 覆盖型客户端重建后最终 name 必须是 Bash（首帧建立，后续空/重复分片均不破坏）。
+	if len(reconstructed) != 1 || reconstructed[0] != "Bash" {
+		t.Errorf("覆盖型重建 name=%v want map[0:Bash]", reconstructed)
+	}
+}
+
 // streamFrames 把原始 SSE 输入经 Stream 处理后解析出所有 JSON 帧及 [DONE] 计数。
 func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount int) {
 	t.Helper()
@@ -280,6 +508,49 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	}
 	if f2["usage"].(map[string]any)["total_tokens"].(float64) != 7 {
 		t.Errorf("frame3 usage=%v", f2["usage"])
+	}
+}
+
+// TestStreamFirstIdPassthrough 帧混合（首帧有 id / 中间帧无 id / 空串 id）：输出每帧 id
+// 必须连续一致（取首帧真实值），不再一律 chatcmpl-wb2api（issue #35 后台聚合：透传流里
+// 每帧同 id 才能按消息归并）。
+func TestStreamFirstIdPassthrough(t *testing.T) {
+	raw := "data: {\"id\":\"chatcmpl-upstream-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		// 中间帧无 id：应复用首帧 id。
+		"data: {\"object\":\"chat.completion.chunk\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n" +
+		// 中间帧 id 为空串：同样复用首帧 id。
+		"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-upstream-9" {
+			t.Errorf("frame %d id=%v want chatcmpl-upstream-9 (首帧真实 id 续传)", i, got)
+		}
+	}
+}
+
+// TestStreamNoIdFallsBackToSentinel 全流无任何真实 id → 兜底 chatcmpl-wb2api
+// （整流无 id 时的既有哨兵，帧与帧之间仍一惯性存在）。
+func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
+	raw := "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}," +
+		"\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	frames, _ := streamFrames(t, raw)
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d want 2", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-wb2api" {
+			t.Errorf("frame %d id=%v want sentinel chatcmpl-wb2api (无真实 id)", i, got)
+		}
 	}
 }
 
@@ -447,6 +718,35 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 				t.Errorf("error frame absent or error field stripped: %q", body)
 			}
 		})
+	}
+}
+
+// TestStreamMidStreamErrorFramePassthrough error-passthrough：SSE 流中带上游 error 帧
+// （如 6004 限流/审核拦截）时，该帧**原样透传**（error 字段不被 normalizeFrame 白名单
+// 剥掉），message/code/requestId 原文可见；且干净帧仍规范化透传、恰好一个 [DONE]。
+func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
+	const errFrame = `{"error":{"message":"您的使用量已超出频率限制","code":"6004","requestId":"req-rl-42"}}`
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		"data: " + errFrame + "\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	// 错误帧原文存续：message/code/requestId 都在。
+	if !strings.Contains(body, "您的使用量已超出频率限制") ||
+		!strings.Contains(body, `"code":"6004"`) ||
+		!strings.Contains(body, `"requestId":"req-rl-42"`) {
+		t.Fatalf("error frame must pass through verbatim (message/code/requestId): %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	// 干净帧仍被规范化透传（error 帧不计入规范化路径，不影响普通帧）。
+	if !strings.Contains(body, `"role":"assistant"`) || !strings.Contains(body, `"content":"hello"`) {
+		t.Errorf("clean frame missing or not normalized: %q", body)
 	}
 }
 

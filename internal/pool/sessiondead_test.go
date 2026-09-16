@@ -1,140 +1,255 @@
 package pool
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
 )
 
-// newPoolWith 构造只含指定账号的池（session-dead 相关测试共用）。
-func newPoolWith(uids ...string) *Pool {
-	p := New("")
-	for _, uid := range uids {
-		p.Add(&auth.Auth{UID: uid, AccessToken: "at-" + uid, RefreshToken: "rt-" + uid})
+// sessionDeadFailsOf 曝露 entry.sessionDeadFails 供测试断言（包内私有 helper）。
+func (p *Pool) sessionDeadFailsOf(uid string) (int, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
 	}
-	return p
+	return e.sessionDeadFails, true
 }
 
-// TestNoteSessionDeadRequiresConsecutive 连续 12153 未达阈值时不得禁用账号。
-//
-// 背景：旧行为一次 12153 就 Disable 且无复活路径，但 12153 会被临时性触发
-// （网络抖动/上游闪断/refresh 竞态），一次失败即永久杀号会误杀健康账号。
-func TestNoteSessionDeadRequiresConsecutive(t *testing.T) {
-	p := newPoolWith("u1")
-	threshold := SessionDeadThreshold()
+// ---------------------------------------------------------------------------
+// sessionDeadFails 持久化（P2-12 / 审查发现 11）
+// ---------------------------------------------------------------------------
 
-	// 前 threshold-1 次都不得禁用。
-	for i := 1; i < threshold; i++ {
-		if disabled := p.NoteSessionDead("u1"); disabled {
-			t.Fatalf("第 %d 次不应禁用（阈值 %d）", i, threshold)
-		}
-		st, _ := p.Status("u1")
-		if st.Disabled {
-			t.Fatalf("第 %d 次后账号不应 disabled", i)
-		}
-	}
-	// 第 threshold 次达阈值 → 禁用。
-	if disabled := p.NoteSessionDead("u1"); !disabled {
-		t.Fatalf("第 %d 次应触发禁用", threshold)
-	}
-	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Error("达阈值后账号应 disabled")
-	}
-	if st.DisabledReason == "" {
-		t.Error("禁用账号应透出 disabled_reason")
-	}
-}
+// TestSessionDeadFailsPersistRoundTrip 连续 12153 计数已持久化：落盘 → 重启 → 恢复。
+// 修复重启归零重学：上游持续 session dead 时不用再吃 2 次失败才禁用。
+func TestSessionDeadFailsPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1") // sessionDeadFails=2（未达阈值 3）
+	p.Flush()
 
-// TestClearSessionDeadResetsCounter 成功（清计数）后，连续计数应从头开始，
-// 不会因历史累积被追杀。
-func TestClearSessionDeadResetsCounter(t *testing.T) {
-	p := newPoolWith("u1")
-	threshold := SessionDeadThreshold()
-
-	// 攒到阈值-1 次。
-	for i := 1; i < threshold; i++ {
-		p.NoteSessionDead("u1")
+	// 重启：连续计数应恢复。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	fails, ok := p2.sessionDeadFailsOf("u1")
+	if !ok {
+		t.Fatal("重启后账号缺失")
 	}
-	// 一次成功清计数。
-	p.ClearSessionDead("u1")
-
-	// 再攒阈值-1 次仍不应禁用（证明计数真的清零了）。
-	for i := 1; i < threshold; i++ {
-		if disabled := p.NoteSessionDead("u1"); disabled {
-			t.Fatalf("计数应已清零，第 %d 次不应禁用", i)
-		}
+	if fails != 2 {
+		t.Fatalf("恢复后 sessionDeadFails=%d want 2（连续计数未持久化）", fails)
 	}
-	st, _ := p.Status("u1")
-	if st.Disabled {
-		t.Error("清计数后不应 disabled")
+	// 重启后下次 12153 从恢复的计数继续累计：第 3 次即达阈值禁用。
+	if !p2.NoteSessionDead("u1") {
+		t.Fatal("恢复计数=2 后第 3 次 12153 应禁用（从恢复值继续累计）")
+	}
+	if st, _ := p2.Status("u1"); !st.Disabled {
+		t.Fatal("恢复后达阈应 disabled")
 	}
 }
 
-// TestNoteSuccessClearsSessionDead 聊天成功也应清连续 12153 计数。
-func TestNoteSuccessClearsSessionDead(t *testing.T) {
-	p := newPoolWith("u1")
-	threshold := SessionDeadThreshold()
-
-	for i := 1; i < threshold; i++ {
-		p.NoteSessionDead("u1")
-	}
-	p.NoteSuccess("u1") // 成功证明 session 未死
-
-	for i := 1; i < threshold; i++ {
-		if disabled := p.NoteSessionDead("u1"); disabled {
-			t.Fatalf("NoteSuccess 后计数应清零，第 %d 次不应禁用", i)
-		}
-	}
-}
-
-// TestReviveDisabled 复活入口：清除 disabled + reason + 计数，账号回到池子。
-func TestReviveDisabled(t *testing.T) {
-	p := newPoolWith("u1")
-	threshold := SessionDeadThreshold()
-	for i := 0; i < threshold; i++ {
-		p.NoteSessionDead("u1")
-	}
-	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Fatal("前置条件：账号应已禁用")
-	}
-
-	p.ReviveDisabled("u1")
-	st, _ = p.Status("u1")
-	if st.Disabled {
-		t.Error("复活后不应 disabled")
-	}
-	if st.DisabledReason != "" {
-		t.Errorf("复活后应清空 disabled_reason, 得到 %q", st.DisabledReason)
-	}
-	// 复活后账号应可被选中（healthy）。
-	if p.Pick() == nil {
-		t.Error("复活后账号应可被 Pick 选中")
-	}
-}
-
-// TestReviveDisabledOnlyAffectsDisabled 复活只对 disabled 账号生效，
-// 不影响正常账号的状态。
-func TestReviveDisabledOnlyAffectsDisabled(t *testing.T) {
-	p := newPoolWith("u1")
+// TestSessionDeadFailsPersistWritesZero sessionDeadFails=0 时也显式落盘
+// （运维口径：零值缺失会误解为"没记录"，实际是零值省略——stateAccount 去 omitempty）。
+func TestSessionDeadFailsPersistWritesZero(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 制造一次 dirty（成功入账）让 Flush 真正写盘，sessionDeadFails 保持 0。
 	p.NoteSuccess("u1")
-	before, _ := p.Status("u1")
+	p.Flush()
 
-	p.ReviveDisabled("u1") // 对未禁用账号是空操作
-
-	after, _ := p.Status("u1")
-	if after.Disabled != before.Disabled || after.SuccessCount != before.SuccessCount {
-		t.Errorf("复活不应改动未禁用账号: before=%+v after=%+v", before, after)
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"session_dead_fails": 0`) {
+		t.Errorf("sessionDeadFails=0 时也应显式写出（运维可见）:\n%s", raw)
 	}
 }
 
-// TestNoteSessionDeadUnknownUID 未知 uid 不应 panic。
-func TestNoteSessionDeadUnknownUID(t *testing.T) {
-	p := newPoolWith("u1")
-	if p.NoteSessionDead("nope") {
-		t.Error("未知 uid 不应返回 true")
+// TestSessionDeadFailsClearPersists 计数清零（refresh/chat 成功）同样落盘：
+// 重启后不残留旧计数。
+func TestSessionDeadFailsClearPersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.ClearSessionDead("u1") // 模拟 refresh 成功：清计数
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if fails, _ := p2.sessionDeadFailsOf("u1"); fails != 0 {
+		t.Errorf("清零后重启 sessionDeadFails=%d want 0", fails)
 	}
-	p.ClearSessionDead("nope")
-	p.ReviveDisabled("nope")
+	// 清零持久化后：重启需重新计满 3 次。
+	if p2.NoteSessionDead("u1") || p2.NoteSessionDead("u1") {
+		t.Fatal("清零后前 2 次不应禁用")
+	}
+	if !p2.NoteSessionDead("u1") {
+		t.Fatal("清零后第 3 次应禁用")
+	}
+}
+
+// TestNoteSessionDeadThresholdNotReached 前 2 次连续 12153 不 Disable（误判防护）。
+func TestNoteSessionDeadThresholdNotReached(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if p.NoteSessionDead("u1") {
+		t.Fatal("第 1 次 12153 不应禁用")
+	}
+	if p.NoteSessionDead("u1") {
+		t.Fatal("第 2 次 12153 不应禁用")
+	}
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("no status")
+	}
+	if st.Disabled {
+		t.Fatalf("连续 2 次 12153 不应禁用: %+v", st)
+	}
+	// 未达阈值时账号仍可选（keepalive 失败不污染选号）。
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
+		t.Fatalf("账号应保持可选, got %+v", got)
+	}
+}
+
+// TestNoteSessionDeadDisablesAtThird 连续第 3 次 12153 → 禁用并清计数。
+func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	if !p.NoteSessionDead("u1") {
+		t.Fatal("第 3 次 12153 应禁用")
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("第 3 次后应 disabled: %+v", st)
+	}
+	if st.Reason != "12153 session dead" {
+		t.Errorf("reason=%q want 12153 session dead", st.Reason)
+	}
+	// 禁用后不再可选。
+	if p.Pick("") != nil {
+		t.Fatal("禁用账号不可被选中")
+	}
+}
+
+// TestClearSessionDeadResetsCount 中间成功（refresh 成功）清计数，后续从 1 重新计。
+func TestClearSessionDeadResetsCount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.ClearSessionDead("u1") // 模拟 refresh 成功：清计数
+	if p.NoteSessionDead("u1") {
+		t.Fatal("清计数后第 1 次不应禁用")
+	}
+	if p.NoteSessionDead("u1") {
+		t.Fatal("清计数后第 2 次不应禁用")
+	}
+	if !p.NoteSessionDead("u1") {
+		t.Fatal("清计数后第 3 次应禁用（从 1 重新计够 3 次）")
+	}
+}
+
+// TestNoteSuccessClearsSessionDeadCount 任意成功（chat 成功）也是 session 未死的强证据，
+// 同样清计数——与 refresh 成功口径一致。
+func TestNoteSuccessClearsSessionDeadCount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.NoteSuccess("u1")
+	if p.NoteSessionDead("u1") {
+		t.Fatal("成功清计数后第 1 次不应禁用")
+	}
+}
+
+// TestReviveDisabled 复活入口：清 disabled + reason + 误判计数，账号回到池子。
+func TestReviveDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1") // 触发禁用
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Fatal("precondition: 应已禁用")
+	}
+	p.ReviveDisabled("u1")
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("no status")
+	}
+	if st.Disabled {
+		t.Fatalf("revive 应清 disabled: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Errorf("reason=%q want 空（revive 清 reason）", st.Reason)
+	}
+	if got := p.Pick(""); got == nil || got.UID != "u1" {
+		t.Fatalf("复活后账号应回到池子, got %+v", got)
+	}
+	// 误判计数一并清零：复活后重新计满 3 次才禁用。
+	p.NoteSessionDead("u1")
+	if p.NoteSessionDead("u1") {
+		t.Fatal("复活后第 2 次不应禁用（应从新计数）")
+	}
+	if !p.NoteSessionDead("u1") {
+		t.Fatal("复活后第 3 次应禁用（从新计数够 3 次）")
+	}
+}
+
+// TestReviveDisabledPersists 复活清 disabled + reason 落盘持久化（重启后不回退）。
+func TestReviveDisabledPersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+	p.ReviveDisabled("u1")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, ok := p2.Status("u1")
+	if !ok || st.Disabled || st.Reason != "" {
+		t.Fatalf("revive 应持久化（disabled=%v reason=%q）ok=%v", st.Disabled, st.Reason, ok)
+	}
+}
+
+// TestStatusDisabledReasonDisabled when disabled, Status 透出 disabled_reason。
+func TestStatusDisabledReasonDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+	st, _ := p.Status("u1")
+	if !st.Disabled || st.DisabledReason != "12153 session dead" {
+		t.Errorf("disabled_reason=%q want 12153 session dead (disabled=%v)", st.DisabledReason, st.Disabled)
+	}
+}
+
+// TestStatusDisabledReasonClearedByRevive 复活后 disabled_reason 归空。
+func TestStatusDisabledReasonClearedByRevive(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+	p.ReviveDisabled("u1")
+	st, _ := p.Status("u1")
+	if st.DisabledReason != "" {
+		t.Errorf("revive 后 disabled_reason=%q want 空", st.DisabledReason)
+	}
+	if st.Reason != "" {
+		t.Errorf("revive 后 reason=%q want 空", st.Reason)
+	}
 }
