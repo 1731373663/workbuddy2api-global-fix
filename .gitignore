@@ -1,0 +1,35 @@
+# Auth & secrets
+auths/
+data/
+# 多实例部署时的额外数据目录（含 state.json 账号状态，不入库）
+data-*/
+*.key
+*.pem
+
+# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
+/login
+/credit
+/wb2api
+/signin_bin
+
+# Config with secrets (use config.example.json)
+config.json
+
+# Build artifacts
+*.tmp
+__pycache__/
+
+# Backups (contains auth tokens)
+backups/
+
+# IDE
+.idea/
+.vscode/
+LOOP.md
+PLAN.md
+SPEC.md
+docs/
+
+# 设计/计划文档（但 README.md 必须进版本库）
+*.md
+!README.md

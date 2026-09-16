@@ -1,0 +1,21 @@
+WorkBuddy2API modifications notice
+=================================
+
+This repository is a modified source distribution of WorkBuddy2API.
+
+Original project:
+  Author: Sliverkiss
+  Repository: https://github.com/Sliverkiss/workbuddy2api
+  License: MIT
+
+Community enhanced branch used as a source reference:
+  Author/repository: https://github.com/287775856/workbuddy2api
+
+Modification in this repository:
+  - Skip CN-only scheduled activities (daily check-in and cat travel) for
+    Global accounts whose auth domain is workbuddy.ai or a subdomain.
+  - Preserve the original MIT license and upstream copyright notice.
+
+No credentials, auths/, data/, local configuration, account identifiers,
+email addresses, or local filesystem paths are included in this source
+distribution.
