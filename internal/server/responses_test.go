@@ -222,3 +222,57 @@ func TestResponsesParallelCallsMerged(t *testing.T) {
 		}
 	}
 }
+
+// TestResponsesCodexItemOrder Codex 实际回传顺序：message(user) → reasoning →
+// function_call → function_call_output，没有独立的 assistant message 文本项。
+// reasoning 必须附着到携带 tool_calls 的 assistant 消息上（上游 11155 回归）。
+func TestResponsesCodexItemOrder(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"run echo hi"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":""}],"encrypted_content":"Y29udGludWU="},
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_shell","arguments":"{\"cmd\":\"echo hi\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"hi"}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d want 3 (user/assistant/tool): %v", len(msgs), msgs)
+	}
+	asst, _ := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("msgs[1] should be assistant: %v", asst)
+	}
+	if rc, _ := asst["reasoning_content"].(string); rc == "" {
+		t.Error("assistant with tool_calls must carry reasoning_content (upstream 11155)")
+	}
+	if tcs, _ := asst["tool_calls"].([]any); len(tcs) != 1 {
+		t.Errorf("tool_calls=%v", asst["tool_calls"])
+	}
+	tool, _ := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" {
+		t.Errorf("tool message wrong: %v", tool)
+	}
+}
+
+// TestReasoningCarrierRoundTrip encrypted_content 载体能被解回原文。
+func TestReasoningCarrierRoundTrip(t *testing.T) {
+	text := "I should run the shell command"
+	enc := reasoningCarrier(text)
+	if enc == "" {
+		t.Fatal("carrier should not be empty")
+	}
+	got := reasoningItemText(map[string]any{"type": "reasoning", "encrypted_content": enc})
+	if got != text {
+		t.Errorf("round trip: got %q want %q", got, text)
+	}
+}

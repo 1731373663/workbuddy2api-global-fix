@@ -16,9 +16,11 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -78,8 +80,18 @@ func textFromContent(raw json.RawMessage) string {
 	return b.String()
 }
 
-// reasoningItemText 取 reasoning item 的文本：优先 summary，其次 content。
+// reasoningItemText 取 reasoning item 的推理文本。
+//
+// 回传优先级：encrypted_content（本网关输出的可回传载体）→ summary → content。
+// Codex 在 store=false 时不会带上被剥离的 summary 之外的信息，因此网关把推理文本
+// 编码进 encrypted_content 交给客户端原样回传，是保证 DeepSeek 思考模式链路不断
+// 的唯一可靠方式（上游要求带 tool_calls 的 assistant 消息必须回传 reasoning_content）。
 func reasoningItemText(it map[string]any) string {
+	if enc, ok := it["encrypted_content"].(string); ok && enc != "" {
+		if raw, err := base64.StdEncoding.DecodeString(enc); err == nil && len(raw) > 0 {
+			return string(raw)
+		}
+	}
 	var b strings.Builder
 	if raw, err := json.Marshal(it["summary"]); err == nil {
 		b.WriteString(textFromContent(raw))
@@ -87,10 +99,30 @@ func reasoningItemText(it map[string]any) string {
 	if raw, err := json.Marshal(it["content"]); err == nil {
 		b.WriteString(textFromContent(raw))
 	}
-	if s, ok := it["encrypted_content"].(string); ok && b.Len() == 0 {
-		_ = s // 加密推理内容无法还原为明文，忽略
-	}
 	return b.String()
+}
+
+// reasoningCarrier 把推理文本编码成可回传载体（encrypted_content）。
+func reasoningCarrier(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString([]byte(text))
+}
+
+// reasoningItem 构造带可回传载体的 reasoning output item。
+func reasoningItem(id, text, status string) map[string]any {
+	item := map[string]any{
+		"type":     "reasoning",
+		"id":       id,
+		"status":   status,
+		"summary":  []any{map[string]any{"type": "summary_text", "text": text}},
+		"content":  []any{},
+	}
+	if c := reasoningCarrier(text); c != "" {
+		item["encrypted_content"] = c
+	}
+	return item
 }
 
 // contentToChat 把 Responses 内容数组转成 Chat 的 content（纯文本或分段数组）。
@@ -154,24 +186,46 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 		}
 	}
 
-	// 同一轮的多个 function_call 合并为一条 assistant 消息；reasoning 文本附回该
-	// 消息的 reasoning_content，满足 DeepSeek 思考模式的回传要求。
+	// Responses 把助手的一轮拆成多个 item（message 文本 + 若干 function_call）；
+	// Chat Completions 要求它们是**同一条** assistant 消息（content + tool_calls）。
+	// 拆成多条会被上游判定工具序列不配对（11148），并丢失 reasoning 关联（11155）。
+	// 因此这里把同一轮的 assistant 文本、reasoning、function_call 合并成一条消息。
 	var pendingReasoning strings.Builder
+	var pendingAssistant strings.Builder
 	var pendingCalls []any
-	flushCalls := func() {
-		if len(pendingCalls) == 0 {
+	flushAssistant := func() {
+		text := pendingAssistant.String()
+		hasCalls := len(pendingCalls) > 0
+		reasoning := strings.TrimSpace(pendingReasoning.String())
+		if !hasCalls && text == "" && reasoning == "" {
 			return
 		}
-		msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": pendingCalls}
-		if r := strings.TrimSpace(pendingReasoning.String()); r != "" {
-			msg["reasoning_content"] = r
+		msg := map[string]any{"role": "assistant"}
+		if text != "" {
+			msg["content"] = text
+		} else {
+			msg["content"] = nil
+		}
+		if hasCalls {
+			msg["tool_calls"] = pendingCalls
+		}
+		// DeepSeek 思考模式要求：带 tool_calls 的 assistant 消息必须携带
+		// reasoning_content（缺失会被上游 400/11155）。无明文可回传时回填最小占位，
+		// 仅满足协议字段要求，不编造推理结论。
+		if reasoning == "" && hasCalls {
+			reasoning = "continued tool use"
+		}
+		if reasoning != "" {
+			msg["reasoning_content"] = reasoning
 		}
 		messages = append(messages, msg)
 		pendingCalls = nil
+		pendingAssistant.Reset()
 		pendingReasoning.Reset()
 	}
 
 	appendInput := func(items []map[string]any) {
+		logResponsesInputShape(items)
 		for _, it := range items {
 			typ, _ := it["type"].(string)
 			switch typ {
@@ -189,13 +243,12 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 					"function": map[string]any{"name": name, "arguments": args},
 				})
 			case "function_call_output":
-				flushCalls()
+				flushAssistant()
 				callID, _ := it["call_id"].(string)
 				messages = append(messages, map[string]any{
 					"role": "tool", "tool_call_id": callID, "content": stringifyOutput(it["output"]),
 				})
 			default:
-				flushCalls()
 				role, _ := it["role"].(string)
 				if role == "" {
 					continue
@@ -203,6 +256,18 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 				if role == "developer" {
 					role = "system"
 				}
+				// assistant 文本先暂存，等同一轮的 function_call 到达后合并成一条消息。
+				if role == "assistant" {
+					if rawContent, ok := it["content"]; ok {
+						if b, err := json.Marshal(rawContent); err == nil {
+							if s := textFromContent(b); s != "" {
+								pendingAssistant.WriteString(s)
+							}
+						}
+					}
+					continue
+				}
+				flushAssistant()
 				if rawContent, ok := it["content"]; ok {
 					if b, err := json.Marshal(rawContent); err == nil {
 						messages = append(messages, map[string]any{"role": role, "content": contentToChat(b)})
@@ -226,7 +291,7 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 			appendInput(items)
 		}
 	}
-	flushCalls()
+	flushAssistant()
 	chat["messages"] = messages
 
 	if len(req.Tools) > 0 {
@@ -301,6 +366,31 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 		return nil, nil, err
 	}
 	return out, &req, nil
+}
+
+// logResponsesInputShape 记录 Codex 回传的 item 结构（只记类型与字段名，不记内容），
+// 用于诊断 reasoning/工具回传协议问题。
+func logResponsesInputShape(items []map[string]any) {
+	if len(items) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		typ, _ := it["type"].(string)
+		if typ == "" {
+			if role, ok := it["role"].(string); ok {
+				typ = "message:" + role
+			} else {
+				typ = "unknown"
+			}
+		}
+		keys := make([]string, 0, len(it))
+		for k := range it {
+			keys = append(keys, k)
+		}
+		parts = append(parts, typ+"{"+strings.Join(keys, ",")+"}")
+	}
+	log.Printf("[responses] input items: %s", strings.Join(parts, " "))
 }
 
 // usageToResponses Chat usage → Responses usage。
@@ -470,10 +560,7 @@ func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec 
 		}
 	}
 	if reasoning.Len() > 0 {
-		output = append([]any{map[string]any{
-			"type": "reasoning", "id": responsesNewID("rs"), "status": "completed",
-			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning.String()}},
-		}}, output...)
+		output = append([]any{reasoningItem(responsesNewID("rs"), reasoning.String(), "completed")}, output...)
 	}
 	if text.Len() > 0 || len(output) == 0 {
 		output = append(output, responsesMessageItem(responsesNewID("msg"), text.String(), "completed"))
@@ -630,7 +717,8 @@ func (p *responsesStreamProxy) openSSE() {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	p.dest.WriteHeader(http.StatusOK)
+	// 不显式 WriteHeader：由首个事件写入触发隐式 200，避免在 chat 路径已写过
+	// 状态码时产生 superfluous response.WriteHeader 噪声。
 }
 
 func (p *responsesStreamProxy) ensureStart() {
@@ -796,10 +884,7 @@ func (p *responsesStreamProxy) finish() {
 			"output_index": p.rsIndex, "summary_index": 0,
 			"part": map[string]any{"type": "summary_text", "text": summary},
 		})
-		item := map[string]any{
-			"type": "reasoning", "id": p.rsID, "status": "completed",
-			"summary": []any{map[string]any{"type": "summary_text", "text": summary}},
-		}
+		item := reasoningItem(p.rsID, summary, "completed")
 		p.emit("response.output_item.done", map[string]any{"output_index": p.rsIndex, "item": item})
 		output = append(output, item)
 	}
