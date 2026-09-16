@@ -3,6 +3,15 @@
 // 网关上游只讲 Chat Completions；Codex 等客户端默认讲 Responses（/v1/responses）。
 // 本文件把 Responses 请求翻译成 Chat 请求，复用现有 chatCompletions 的选号/轮转/
 // 重试/统计全链路，再把结果翻译回 Responses 协议（含 Codex 依赖的语义化流式事件）。
+//
+// 关键约束（DeepSeek 思考模式 + 工具循环）：
+//   - 上游要求有 tool_calls 的 assistant 消息必须携带 reasoning_content，
+//     否则报 11155 reasoning_content_missing；
+//   - 同一轮的多个 function_call 必须合并进一条 assistant 消息的 tool_calls，
+//     并保证 function_call_output 紧随其后，否则报 11148 tool_call_sequence_broken。
+//
+// 因此 Responses 的 reasoning item 内容会被收集并附回 assistant 消息，多个
+// function_call item 会被合并为一条 assistant 消息。
 package server
 
 import (
@@ -24,20 +33,19 @@ func responsesNewID(prefix string) string {
 
 // responsesRequest 只解析适配层需要的字段，其余原样忽略。
 type responsesRequest struct {
-	Model              string          `json:"model"`
-	Input              json.RawMessage `json:"input"`
-	Instructions       json.RawMessage `json:"instructions"`
-	Stream             bool            `json:"stream"`
-	Tools              []json.RawMessage `json:"tools"`
-	ToolChoice         json.RawMessage `json:"tool_choice"`
-	MaxOutputTokens    *int            `json:"max_output_tokens"`
-	Temperature        *float64        `json:"temperature"`
-	TopP               *float64        `json:"top_p"`
-	ParallelToolCalls  *bool           `json:"parallel_tool_calls"`
-	Reasoning          json.RawMessage `json:"reasoning"`
-	Text               json.RawMessage `json:"text"`
-	PromptCacheKey     string          `json:"prompt_cache_key"`
-	PreviousResponseID string          `json:"previous_response_id"`
+	Model             string            `json:"model"`
+	Input             json.RawMessage   `json:"input"`
+	Instructions      json.RawMessage   `json:"instructions"`
+	Stream            bool              `json:"stream"`
+	Tools             []json.RawMessage `json:"tools"`
+	ToolChoice        json.RawMessage   `json:"tool_choice"`
+	MaxOutputTokens   *int              `json:"max_output_tokens"`
+	Temperature       *float64          `json:"temperature"`
+	TopP              *float64          `json:"top_p"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls"`
+	Reasoning         json.RawMessage   `json:"reasoning"`
+	Text              json.RawMessage   `json:"text"`
+	PromptCacheKey    string            `json:"prompt_cache_key"`
 }
 
 // textFromContent 把 Responses 的 content（字符串或内容数组）压平成纯文本。
@@ -57,7 +65,7 @@ func textFromContent(raw json.RawMessage) string {
 	for _, p := range parts {
 		t, _ := p["type"].(string)
 		switch t {
-		case "input_text", "output_text", "text", "summary_text":
+		case "input_text", "output_text", "text", "summary_text", "reasoning_text":
 			if v, ok := p["text"].(string); ok {
 				b.WriteString(v)
 			}
@@ -66,6 +74,21 @@ func textFromContent(raw json.RawMessage) string {
 				b.WriteString(v)
 			}
 		}
+	}
+	return b.String()
+}
+
+// reasoningItemText 取 reasoning item 的文本：优先 summary，其次 content。
+func reasoningItemText(it map[string]any) string {
+	var b strings.Builder
+	if raw, err := json.Marshal(it["summary"]); err == nil {
+		b.WriteString(textFromContent(raw))
+	}
+	if raw, err := json.Marshal(it["content"]); err == nil {
+		b.WriteString(textFromContent(raw))
+	}
+	if s, ok := it["encrypted_content"].(string); ok && b.Len() == 0 {
+		_ = s // 加密推理内容无法还原为明文，忽略
 	}
 	return b.String()
 }
@@ -97,6 +120,21 @@ func contentToChat(raw json.RawMessage) any {
 	return out
 }
 
+// stringifyOutput 工具的 output 可能是字符串或结构化数组，统一转成字符串。
+func stringifyOutput(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	default:
+		if raw, err := json.Marshal(t); err == nil {
+			return string(raw)
+		}
+		return ""
+	}
+}
+
 // responsesToChat 把 Responses 请求体翻译成 Chat Completions 请求体。
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	var req responsesRequest
@@ -116,31 +154,48 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 		}
 	}
 
+	// 同一轮的多个 function_call 合并为一条 assistant 消息；reasoning 文本附回该
+	// 消息的 reasoning_content，满足 DeepSeek 思考模式的回传要求。
+	var pendingReasoning strings.Builder
+	var pendingCalls []any
+	flushCalls := func() {
+		if len(pendingCalls) == 0 {
+			return
+		}
+		msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": pendingCalls}
+		if r := strings.TrimSpace(pendingReasoning.String()); r != "" {
+			msg["reasoning_content"] = r
+		}
+		messages = append(messages, msg)
+		pendingCalls = nil
+		pendingReasoning.Reset()
+	}
+
 	appendInput := func(items []map[string]any) {
 		for _, it := range items {
 			typ, _ := it["type"].(string)
 			switch typ {
+			case "reasoning":
+				pendingReasoning.WriteString(reasoningItemText(it))
 			case "function_call":
 				callID, _ := it["call_id"].(string)
+				if callID == "" {
+					callID, _ = it["id"].(string)
+				}
 				name, _ := it["name"].(string)
 				args, _ := it["arguments"].(string)
-				messages = append(messages, map[string]any{
-					"role":    "assistant",
-					"content": nil,
-					"tool_calls": []any{map[string]any{
-						"id": callID, "type": "function",
-						"function": map[string]any{"name": name, "arguments": args},
-					}},
+				pendingCalls = append(pendingCalls, map[string]any{
+					"id": callID, "type": "function",
+					"function": map[string]any{"name": name, "arguments": args},
 				})
 			case "function_call_output":
+				flushCalls()
 				callID, _ := it["call_id"].(string)
-				out, _ := it["output"].(string)
 				messages = append(messages, map[string]any{
-					"role": "tool", "tool_call_id": callID, "content": out,
+					"role": "tool", "tool_call_id": callID, "content": stringifyOutput(it["output"]),
 				})
-			case "reasoning":
-				// 上游不接收 Responses 的 reasoning 回灌，跳过（内容已由后续消息承载）。
 			default:
+				flushCalls()
 				role, _ := it["role"].(string)
 				if role == "" {
 					continue
@@ -171,6 +226,7 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 			appendInput(items)
 		}
 	}
+	flushCalls()
 	chat["messages"] = messages
 
 	if len(req.Tools) > 0 {
@@ -253,15 +309,15 @@ func usageToResponses(u *UsageDetail) map[string]any {
 		return map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 	}
 	return map[string]any{
-		"input_tokens":  u.PromptTokens,
-		"output_tokens": u.CompletionTokens,
-		"total_tokens":  u.TotalTokens,
-		"input_tokens_details": map[string]any{"cached_tokens": u.CacheHitTokens},
+		"input_tokens":          u.PromptTokens,
+		"output_tokens":         u.CompletionTokens,
+		"total_tokens":          u.TotalTokens,
+		"input_tokens_details":  map[string]any{"cached_tokens": u.CacheHitTokens},
 		"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 	}
 }
 
-// responsesEnvelope 构造 Response 对象（status/created_at/output/usage 由调用方填充）。
+// responsesEnvelope 构造 Response 对象。
 func responsesEnvelope(id, model, status string, output []any, usage map[string]any) map[string]any {
 	if output == nil {
 		output = []any{}
@@ -431,6 +487,16 @@ func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec 
 	writeJSON(w, http.StatusOK, env)
 }
 
+// responsesCall 单个 function_call 的累计状态。
+type responsesCall struct {
+	id     string
+	callID string
+	name   string
+	args   strings.Builder
+	index  int
+	added  bool
+}
+
 // responsesStreamProxy 实现 http.ResponseWriter，把 chatCompletions 写出的
 // SSE 帧实时翻译成 Responses 语义事件。
 type responsesStreamProxy struct {
@@ -445,31 +511,25 @@ type responsesStreamProxy struct {
 	respID    string
 	started   bool
 	completed bool
+	seq       int
+	nextIndex int
 
-	seq int
-
-	msgID     string
-	msgOpen   bool
-	text      strings.Builder
-	reasoning strings.Builder
-	rsOpen    bool
+	rsOpen   bool
+	rsID     string
+	rsIndex  int
+	rsText   strings.Builder
+	rsDone   bool
+	msgOpen  bool
+	msgID    string
+	msgIndex int
+	text     strings.Builder
 
 	calls     map[int]*responsesCall
 	callOrder []int
-	output    []any
 
-	usage     *UsageDetail
-	hadError  bool
-	errMsg    string
-}
-
-type responsesCall struct {
-	id       string
-	callID   string
-	name     string
-	args     strings.Builder
-	added    bool
-	finished bool
+	usage    *UsageDetail
+	hadError bool
+	errMsg   string
 }
 
 func newResponsesStreamProxy(dest http.ResponseWriter, meta *responsesRequest) *responsesStreamProxy {
@@ -498,6 +558,11 @@ func (p *responsesStreamProxy) Flush() {
 	if p.fl != nil {
 		p.fl.Flush()
 	}
+}
+func (p *responsesStreamProxy) allocIndex() int {
+	i := p.nextIndex
+	p.nextIndex++
+	return i
 }
 
 // drain 解析缓冲区里已完整的 SSE 帧。
@@ -558,17 +623,22 @@ func (p *responsesStreamProxy) handleChunk(payload string) {
 	}
 }
 
-func (p *responsesStreamProxy) ensureStart() {
-	if p.started {
-		return
-	}
-	p.started = true
+// openSSE 发送 SSE 响应头（只发一次）。
+func (p *responsesStreamProxy) openSSE() {
 	h := p.dest.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	p.dest.WriteHeader(http.StatusOK)
+}
+
+func (p *responsesStreamProxy) ensureStart() {
+	if p.started {
+		return
+	}
+	p.started = true
+	p.openSSE()
 	p.emit("response.created", map[string]any{
 		"response": responsesEnvelope(p.respID, p.meta.Model, "in_progress", nil, nil),
 	})
@@ -593,22 +663,24 @@ func (p *responsesStreamProxy) emit(eventType string, fields map[string]any) {
 
 func (p *responsesStreamProxy) appendReasoning(delta string) {
 	p.ensureStart()
-	p.reasoning.WriteString(delta)
+	p.rsText.WriteString(delta)
 	if !p.rsOpen {
 		p.rsOpen = true
+		p.rsID = responsesNewID("rs")
+		p.rsIndex = p.allocIndex()
 		p.emit("response.output_item.added", map[string]any{
-			"output_index": 0,
+			"output_index": p.rsIndex,
 			"item": map[string]any{
-				"type": "reasoning", "id": responsesNewID("rs"), "status": "in_progress", "summary": []any{},
+				"type": "reasoning", "id": p.rsID, "status": "in_progress", "summary": []any{},
 			},
 		})
 		p.emit("response.reasoning_summary_part.added", map[string]any{
-			"output_index": 0, "summary_index": 0,
+			"output_index": p.rsIndex, "summary_index": 0,
 			"part": map[string]any{"type": "summary_text", "text": ""},
 		})
 	}
 	p.emit("response.reasoning_summary_text.delta", map[string]any{
-		"output_index": 0, "summary_index": 0, "delta": delta,
+		"output_index": p.rsIndex, "summary_index": 0, "delta": delta,
 	})
 }
 
@@ -617,17 +689,18 @@ func (p *responsesStreamProxy) appendText(delta string) {
 	if !p.msgOpen {
 		p.msgOpen = true
 		p.msgID = responsesNewID("msg")
+		p.msgIndex = p.allocIndex()
 		p.emit("response.output_item.added", map[string]any{
-			"output_index": p.outputIndex(), "item": responsesMessageItem(p.msgID, "", "in_progress"),
+			"output_index": p.msgIndex, "item": responsesMessageItem(p.msgID, "", "in_progress"),
 		})
 		p.emit("response.content_part.added", map[string]any{
-			"item_id": p.msgID, "output_index": p.outputIndex(), "content_index": 0,
+			"item_id": p.msgID, "output_index": p.msgIndex, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 		})
 	}
 	p.text.WriteString(delta)
 	p.emit("response.output_text.delta", map[string]any{
-		"item_id": p.msgID, "output_index": p.outputIndex(), "content_index": 0, "delta": delta,
+		"item_id": p.msgID, "output_index": p.msgIndex, "content_index": 0, "delta": delta,
 	})
 }
 
@@ -644,7 +717,7 @@ func (p *responsesStreamProxy) appendToolCalls(tcs []any) {
 		}
 		call := p.calls[idx]
 		if call == nil {
-			call = &responsesCall{id: responsesNewID("fc")}
+			call = &responsesCall{}
 			p.calls[idx] = call
 			p.callOrder = append(p.callOrder, idx)
 		}
@@ -655,112 +728,126 @@ func (p *responsesStreamProxy) appendToolCalls(tcs []any) {
 			if v, ok := fn["name"].(string); ok && v != "" {
 				call.name = v
 			}
-			if v, ok := fn["arguments"].(string); ok && v != "" {
-				if !call.added {
-					// 首个参数分片：先发 item.added，再发 delta。
-					call.added = true
-					if call.callID == "" {
-						call.callID = responsesNewID("call")
-					}
-					p.emit("response.output_item.added", map[string]any{
-						"output_index": p.outputIndex(),
-						"item": map[string]any{
-							"type": "function_call", "id": call.id, "call_id": call.callID,
-							"name": call.name, "arguments": "", "status": "in_progress",
-						},
-					})
+			// 首见即宣告 item（即使参数分片尚未到达），避免无参工具丢失。
+			if !call.added {
+				call.added = true
+				call.id = responsesNewID("fc")
+				if call.callID == "" {
+					call.callID = responsesNewID("call")
 				}
+				call.index = p.allocIndex()
+				p.emit("response.output_item.added", map[string]any{
+					"output_index": call.index,
+					"item": map[string]any{
+						"type": "function_call", "id": call.id, "call_id": call.callID,
+						"name": call.name, "arguments": "", "status": "in_progress",
+					},
+				})
+			}
+			if v, ok := fn["arguments"].(string); ok && v != "" {
 				call.args.WriteString(v)
 				p.emit("response.function_call_arguments.delta", map[string]any{
-					"item_id": call.id, "output_index": p.outputIndex(), "delta": v,
+					"item_id": call.id, "output_index": call.index, "delta": v,
 				})
 			}
 		}
 	}
 }
 
-func (p *responsesStreamProxy) outputIndex() int {
-	n := 0
-	if p.rsOpen {
-		n++
-	}
-	if p.msgOpen {
-		n++
-	}
-	n += len(p.callOrder)
-	if n > 0 {
-		n--
-	}
-	return n
-}
-
-// finish 收尾：关闭未结束的 item，发出 response.completed（或错误事件）。
+// finish 收尾：关闭未结束的 item，发出 response.completed / response.failed。
 func (p *responsesStreamProxy) finish() {
 	if p.completed {
 		return
 	}
 	p.completed = true
-	p.ensureStart()
 
-	if p.hadError {
+	// 上游失败（chatCompletions 走了错误分支）：把错误翻译成 response.failed，
+	// 避免把 JSON 错误体直接当作 SSE 写给客户端。
+	if p.status >= 400 || p.hadError {
+		p.openSSE()
+		msg := strings.TrimSpace(p.buf.String())
+		if p.errMsg != "" {
+			msg = p.errMsg
+		}
+		if msg == "" {
+			msg = "upstream request failed"
+		}
+		p.emit("response.created", map[string]any{
+			"response": responsesEnvelope(p.respID, p.meta.Model, "in_progress", nil, nil),
+		})
 		p.emit("response.failed", map[string]any{
 			"response": map[string]any{
 				"id": p.respID, "object": "response", "status": "failed",
-				"error": map[string]any{"code": "server_error", "message": p.errMsg},
+				"model": p.meta.Model, "output": []any{},
+				"error": map[string]any{"code": "server_error", "message": msg},
 			},
 		})
 		return
 	}
+	p.ensureStart()
+
 	output := make([]any, 0, 4)
 	if p.rsOpen {
-		summary := p.reasoning.String()
+		summary := p.rsText.String()
 		p.emit("response.reasoning_summary_text.done", map[string]any{
-			"output_index": 0, "summary_index": 0, "text": summary,
+			"output_index": p.rsIndex, "summary_index": 0, "text": summary,
 		})
 		p.emit("response.reasoning_summary_part.done", map[string]any{
-			"output_index": 0, "summary_index": 0,
+			"output_index": p.rsIndex, "summary_index": 0,
 			"part": map[string]any{"type": "summary_text", "text": summary},
 		})
 		item := map[string]any{
-			"type": "reasoning", "id": responsesNewID("rs"), "status": "completed",
+			"type": "reasoning", "id": p.rsID, "status": "completed",
 			"summary": []any{map[string]any{"type": "summary_text", "text": summary}},
 		}
-		p.emit("response.output_item.done", map[string]any{"output_index": 0, "item": item})
+		p.emit("response.output_item.done", map[string]any{"output_index": p.rsIndex, "item": item})
 		output = append(output, item)
 	}
 	if p.msgOpen {
 		text := p.text.String()
 		p.emit("response.output_text.done", map[string]any{
-			"item_id": p.msgID, "output_index": p.outputIndex(), "content_index": 0, "text": text,
+			"item_id": p.msgID, "output_index": p.msgIndex, "content_index": 0, "text": text,
 		})
 		p.emit("response.content_part.done", map[string]any{
-			"item_id": p.msgID, "output_index": p.outputIndex(), "content_index": 0,
+			"item_id": p.msgID, "output_index": p.msgIndex, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
 		})
 		item := responsesMessageItem(p.msgID, text, "completed")
-		p.emit("response.output_item.done", map[string]any{"output_index": p.outputIndex(), "item": item})
+		p.emit("response.output_item.done", map[string]any{"output_index": p.msgIndex, "item": item})
 		output = append(output, item)
 	}
-	for i, idx := range p.callOrder {
+	for _, idx := range p.callOrder {
 		call := p.calls[idx]
 		if call == nil {
 			continue
 		}
+		if call.id == "" {
+			call.id = responsesNewID("fc")
+		}
 		if call.callID == "" {
 			call.callID = responsesNewID("call")
 		}
+		if !call.added {
+			call.added = true
+			call.index = p.allocIndex()
+			p.emit("response.output_item.added", map[string]any{
+				"output_index": call.index,
+				"item": map[string]any{
+					"type": "function_call", "id": call.id, "call_id": call.callID,
+					"name": call.name, "arguments": "", "status": "in_progress",
+				},
+			})
+		}
 		args := call.args.String()
-		oi := len(output)
 		p.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": call.id, "output_index": oi, "arguments": args,
+			"item_id": call.id, "output_index": call.index, "arguments": args,
 		})
 		item := map[string]any{
 			"type": "function_call", "id": call.id, "call_id": call.callID,
 			"name": call.name, "arguments": args, "status": "completed",
 		}
-		p.emit("response.output_item.done", map[string]any{"output_index": oi, "item": item})
+		p.emit("response.output_item.done", map[string]any{"output_index": call.index, "item": item})
 		output = append(output, item)
-		_ = i
 	}
 	if len(output) == 0 {
 		item := responsesMessageItem(responsesNewID("msg"), "", "completed")
@@ -770,8 +857,7 @@ func (p *responsesStreamProxy) finish() {
 	p.emit("response.completed", map[string]any{"response": env})
 }
 
-// responsesGet 满足部分客户端对 GET /v1/responses/{id} 的探活/查询；
-// 网关不保存会话状态，返回 404 语义错误由客户端按 unsupported 处理。
+// responsesGet 网关不保存会话状态；返回 404 由客户端按 unsupported 处理。
 func (h *Handler) responsesGet(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusNotFound, "not_found", "response state is not stored by this gateway")
 }

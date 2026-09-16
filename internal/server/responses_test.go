@@ -136,3 +136,89 @@ func TestResponsesWriteNonStream(t *testing.T) {
 		t.Errorf("usage=%v", usage)
 	}
 }
+
+// TestResponsesReasoningMergedIntoAssistant DeepSeek 思考模式：reasoning item 的
+// 文本必须回填到带 tool_calls 的 assistant 消息，避免 11155 reasoning_content_missing。
+func TestResponsesReasoningMergedIntoAssistant(t *testing.T) {
+	body := []byte(`{
+		"model":"cn:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"ls"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should run ls"}]},
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"a.txt"}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d want 3: %v", len(msgs), msgs)
+	}
+	asst, _ := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("msgs[1] should be assistant: %v", asst)
+	}
+	if asst["reasoning_content"] != "I should run ls" {
+		t.Errorf("reasoning_content=%v want %q", asst["reasoning_content"], "I should run ls")
+	}
+	tcs, _ := asst["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls=%v", asst["tool_calls"])
+	}
+	tool, _ := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" || tool["content"] != "a.txt" {
+		t.Errorf("tool message wrong: %v", tool)
+	}
+}
+
+// TestResponsesParallelCallsMerged 同轮多个 function_call 合并进一条 assistant 消息，
+// 结果紧随其后，避免 11148 tool_call_sequence_broken。
+func TestResponsesParallelCallsMerged(t *testing.T) {
+	body := []byte(`{
+		"model":"cn:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":"go"},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}]},
+			{"type":"function_call","call_id":"c1","name":"a","arguments":"{}"},
+			{"type":"function_call","call_id":"c2","name":"b","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":"r1"},
+			{"type":"function_call_output","call_id":"c2","output":"r2"}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len=%d want 4: %v", len(msgs), msgs)
+	}
+	asst, _ := msgs[1].(map[string]any)
+	tcs, _ := asst["tool_calls"].([]any)
+	if len(tcs) != 2 {
+		t.Fatalf("assistant should carry 2 tool_calls: %v", asst)
+	}
+	for i, want := range []string{"c1", "c2"} {
+		tc, _ := tcs[i].(map[string]any)
+		if tc["id"] != want {
+			t.Errorf("tool_calls[%d].id=%v want %s", i, tc["id"], want)
+		}
+	}
+	for i, want := range []string{"c1", "c2"} {
+		tool, _ := msgs[2+i].(map[string]any)
+		if tool["role"] != "tool" || tool["tool_call_id"] != want {
+			t.Errorf("msgs[%d] want tool %s: %v", 2+i, want, tool)
+		}
+	}
+}
