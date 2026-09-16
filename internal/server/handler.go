@@ -628,12 +628,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	// fullWaitBudget 并发占满时的等待预算：每轮 150ms，最多 200 轮（约 30s）。
+	// fullWaitBudget 并发占满时的等待预算：每轮 150ms，最多 600 轮（约 90s）。
 	// 超出预算仍无名额才回 503，避免极端情况下无限等待拖死客户端。
 	// 预算取值依据：单账号并发槽位有限（global 默认 4），Codex 一次任务可能并行
-	// 发十几个请求；每个请求数秒，排队尾部的等待可达十几秒，预算过小会把本可
-	// 完成的请求判成 503（表现为对话中途断线）。
-	fullWaitBudget := 200
+	// 发十几个请求；单个长任务（十几秒生成）排队 3 波时尾部等待可达 40s+，
+	// 预算过小会把本可完成的请求判成 503（表现为对话中途断线）。
+	// 该等待只在「存在健康但占满的账号」时发生；等待期间若账号转为冷却，
+	// 下一轮重试会立即判定为不可服务并返回 503，不会空等满预算。
+	fullWaitBudget := 600
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -740,6 +742,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
+			// 瞬时网络故障（TLS 握手超时 / 连接重置 / 临时 DNS 失败）允许同一账号重试：
+			// 单账号部署下若把该号永久标为 tried，轮转就再也选不到号——一次网络抖动
+			// 直接变成 503，表现为对话中途断线。MaxRotate 仍限制总尝试次数，不会失控。
+			delete(tried, acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
 			}
