@@ -948,12 +948,10 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
 //     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。P1-2 后冷却时长
 //     优先采信 Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
-//   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
-//     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
-//     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
-//     封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避（比 429 的 soft_rate 严：
-//     基数小但响应快；WAF 信号带 IP 级粘性故指数升级保底存在）。基数经 jitterDur
-//     抖动（复用 backoff.go 单一抖动来源，防多账号同相位冷却到期再聚团）。
+//   - ErrWafBlock → 账号级**固定**短冷却（不 Disable，不走指数升级）：WAF 403 是
+//     IP/指纹维风控信号，账号本身健康，罚过即走、到期自愈。时长优先 Retry-After 头，
+//     缺失按 wafCooldownBase(60s)。刻意不用 softStreak 指数升级：WAF 403 常由重试/
+//     并发触发，指数退避会让冷却越滚越长并诱发下一轮同样命中（雪崩）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
