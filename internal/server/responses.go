@@ -113,11 +113,11 @@ func reasoningCarrier(text string) string {
 // reasoningItem 构造带可回传载体的 reasoning output item。
 func reasoningItem(id, text, status string) map[string]any {
 	item := map[string]any{
-		"type":     "reasoning",
-		"id":       id,
-		"status":   status,
-		"summary":  []any{map[string]any{"type": "summary_text", "text": text}},
-		"content":  []any{},
+		"type":    "reasoning",
+		"id":      id,
+		"status":  status,
+		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
+		"content": []any{},
 	}
 	if c := reasoningCarrier(text); c != "" {
 		item["encrypted_content"] = c
@@ -150,6 +150,70 @@ func contentToChat(raw json.RawMessage) any {
 		return textFromContent(raw)
 	}
 	return out
+}
+
+// toolOutputToChat converts function_call_output.output into Chat tool content.
+// Plain strings stay strings. Standard content blocks (notably images) become
+// chat multimodal parts instead of being JSON-stringified: a data URL image
+// would otherwise travel as high-entropy base64 text, which the upstream
+// tokenizer charges at roughly 0.7 token per character (a 100KB PNG measured
+// about 93k prompt tokens, versus about 250 tokens as an image part).
+func toolOutputToChat(v any) any {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		if isImageDataURL(t) {
+			return []any{map[string]any{
+				"type": "image_url", "image_url": map[string]any{"url": t},
+			}}
+		}
+		return t
+	case []any:
+		out := make([]any, 0, len(t))
+		for _, part := range t {
+			p, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch p["type"] {
+			case "input_text", "output_text", "text":
+				if text, ok := p["text"].(string); ok {
+					out = append(out, map[string]any{"type": "text", "text": text})
+				}
+			case "input_image":
+				url := ""
+				if u, ok := p["image_url"].(string); ok {
+					url = u
+				} else if m, ok := p["image_url"].(map[string]any); ok {
+					url, _ = m["url"].(string)
+				}
+				if url != "" {
+					out = append(out, map[string]any{
+						"type": "image_url", "image_url": map[string]any{"url": url},
+					})
+				}
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	if raw, err := json.Marshal(v); err == nil {
+		return string(raw)
+	}
+	return ""
+}
+
+// isImageDataURL reports whether s is a base64 data URL for a supported image
+// type. Tool output occasionally carries a raw data URL string rather than a
+// structured content block; sending it as text makes the tokenizer charge the
+// base64 payload by character instead of billing it as an image.
+func isImageDataURL(s string) bool {
+	if len(s) < 32 || !strings.HasPrefix(s, "data:image/") {
+		return false
+	}
+	return strings.Contains(s, ";base64,")
 }
 
 // stringifyOutput 工具的 output 可能是字符串或结构化数组，统一转成字符串。
@@ -246,7 +310,7 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 				flushAssistant()
 				callID, _ := it["call_id"].(string)
 				messages = append(messages, map[string]any{
-					"role": "tool", "tool_call_id": callID, "content": stringifyOutput(it["output"]),
+					"role": "tool", "tool_call_id": callID, "content": toolOutputToChat(it["output"]),
 				})
 			default:
 				role, _ := it["role"].(string)

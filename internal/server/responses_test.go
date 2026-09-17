@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -134,6 +135,94 @@ func TestResponsesWriteNonStream(t *testing.T) {
 	usage, _ := env["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(5) || usage["output_tokens"] != float64(2) {
 		t.Errorf("usage=%v", usage)
+	}
+}
+
+// TestResponsesToolOutputImageStaysMultimodal guards the token-bloat regression:
+// a function_call_output image part must reach the upstream as an image_url
+// part, not as a JSON-stringified data URL charged as base64 text.
+func TestResponsesToolOutputImageStaysMultimodal(t *testing.T) {
+	dataURL := "data:image/png;base64,aGVsbG8="
+	body, err := json.Marshal(map[string]any{
+		"model": "cn:deepseek-v4.1-flash",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "go"},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "noop", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": []any{
+				map[string]any{"type": "input_text", "text": "tool returned image:"},
+				map[string]any{"type": "input_image", "image_url": dataURL},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages len=%d want 3: %v", len(msgs), msgs)
+	}
+	tool, _ := msgs[2].(map[string]any)
+	parts, ok := tool["content"].([]any)
+	if !ok {
+		t.Fatalf("tool content should stay multimodal, got %T: %v", tool["content"], tool["content"])
+	}
+	if len(parts) != 2 {
+		t.Fatalf("tool content parts=%d want 2: %v", len(parts), parts)
+	}
+	img, _ := parts[1].(map[string]any)
+	if img["type"] != "image_url" {
+		t.Fatalf("second part type=%v want image_url", img["type"])
+	}
+	iu, _ := img["image_url"].(map[string]any)
+	if iu["url"] != dataURL {
+		t.Fatalf("image url lost: %v", iu)
+	}
+}
+
+// TestResponsesToolOutputRawDataURLImageStaysMultimodal covers clients that
+// deliver a bare image data URL in the string form of function_call_output.
+func TestResponsesToolOutputRawDataURLImageStaysMultimodal(t *testing.T) {
+	dataURL := "data:image/png;base64," + strings.Repeat("A", 64)
+	body, err := json.Marshal(map[string]any{
+		"model": "cn:deepseek-v4.1-flash",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "go"},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "noop", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": dataURL},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	tool, _ := msgs[2].(map[string]any)
+	parts, ok := tool["content"].([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("tool content should be one image part, got %T: %v", tool["content"], tool["content"])
+	}
+	img, _ := parts[0].(map[string]any)
+	if img["type"] != "image_url" {
+		t.Fatalf("part type=%v want image_url", img["type"])
+	}
+	iu, _ := img["image_url"].(map[string]any)
+	if iu["url"] != dataURL {
+		t.Fatalf("image url lost: %v", iu)
 	}
 }
 

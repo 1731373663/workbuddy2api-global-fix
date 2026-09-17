@@ -38,7 +38,7 @@ func (c *Client) ResourcePackages(a *auth.Auth) ([]ResourcePackage, error) {
 	if err != nil {
 		return nil, err
 	}
-	BillingHeaders(req, a)
+	c.BillingHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return nil, err
