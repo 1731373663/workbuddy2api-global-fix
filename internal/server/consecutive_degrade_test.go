@@ -79,6 +79,9 @@ func TestApplyErrorPolicyClassifiedErrorsNotFed(t *testing.T) {
 // TestChatTransportErrorFeedsConsecutiveFailures 传输层失败（连不上上游）喂连败
 // （issue #114 端到端）：N 连败后该号出池（AvailableUIDs 不再含它），仍不熔断。
 // fake transport 返回 error（非 *upstream.Error）→ handler 网络抖动分支。
+//
+// 用两个账号：单账号域刻意豁免连败降权（见 TestChatSingleAccountRealmNotDegraded），
+// 因为把域内唯一账号降权出池等于让整个域不可用。多账号域维持既有降权语义。
 func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	var calls int
 	up := &upstream.Client{
@@ -92,7 +95,9 @@ func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	p := pool.New("")
 	p.SetDegrade(2, time.Hour, 2*time.Hour) // 阈 2：两轮请求即降权
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999})
 	p.SetCredits("u1", 1000)
+	p.SetCredits("u2", 1000)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	for round := 0; round < 2; round++ {
@@ -102,7 +107,7 @@ func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 			t.Fatalf("round %d: transport error 应回 503, got %d", round, rec.Code)
 		}
 	}
-	// 两轮（每轮 1 次传输失败）后：连败=2 已达阈 → 降权出池。
+	// 两轮（每轮两个号各 1 次传输失败）后：各号连败=2 已达阈 → 全部降权出池。
 	if uids := p.AvailableUIDs(); len(uids) != 0 {
 		t.Fatalf("连败达阈后账号应出池, still available: %v", uids)
 	}
@@ -112,6 +117,43 @@ func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	}
 	if st.BreakerFails != 0 {
 		t.Fatalf("传输层错误不喂熔断（既有语义不回归）, fails=%d", st.BreakerFails)
+	}
+}
+
+// TestChatSingleAccountRealmNotDegraded 单账号域豁免连败降权：域内只有一个账号时，
+// 把它降权出池等于让整个域不可用（实测一次上游 EOF 抖动后海外域整体 503）。
+// 该场景下账号保持可用，由请求级 tried/MaxRotate 限制重复打击上游。
+func TestChatSingleAccountRealmNotDegraded(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("dial tcp: connection refused")
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := pool.New("")
+	p.SetDegrade(2, time.Hour, 2*time.Hour)
+	p.Add(&auth.Auth{UID: "solo", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("solo", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	// 连打 4 轮（远超降权阈值 2）：域内唯一账号不得被降权出池。
+	for round := 0; round < 4; round++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		if rec.Code != 503 {
+			t.Fatalf("round %d: transport error 应回 503, got %d", round, rec.Code)
+		}
+	}
+	if uids := p.AvailableUIDs(); len(uids) != 1 {
+		t.Fatalf("单账号域不应被降权出池, available=%v", uids)
+	}
+	st, _ := p.Status("solo")
+	if st.CoolKind == "degrade" {
+		t.Fatalf("单账号域不应进入降权态: %+v", st)
+	}
+	if st.BreakerFails != 0 {
+		t.Fatalf("传输层错误不喂熔断, fails=%d", st.BreakerFails)
 	}
 }
 

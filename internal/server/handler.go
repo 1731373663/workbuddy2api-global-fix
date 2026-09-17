@@ -740,12 +740,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
+			// 连败降权：语义是「先别用这个号，换别的号试试」。域内仅此一个账号时
+			// 不喂计数——把唯一账号降权出池等于让整个域不可用（实测一次上游 EOF
+			// 抖动后海外域整体 503）。多账号时维持既有降权语义不变。
+			if total, _, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realm); total > 1 {
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			fail(acct.UID)
-			// 瞬时网络故障（TLS 握手超时 / 连接重置 / 临时 DNS 失败）允许同一账号重试：
-			// 单账号部署下若把该号永久标为 tried，轮转就再也选不到号——一次网络抖动
-			// 直接变成 503，表现为对话中途断线。MaxRotate 仍限制总尝试次数，不会失控。
-			delete(tried, acct.UID)
+			// 不再把该号从 tried 移除：同一请求内重复打同一账号会把一次网络抖动放大
+			// 成多次上游调用（global 域对频控更敏感）。瞬时故障的正确恢复路径是
+			// 「本请求失败 → 客户端重试 → 账号仍在池内」，而不是请求内自旋重试。
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
 			}
