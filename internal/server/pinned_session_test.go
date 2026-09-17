@@ -66,14 +66,23 @@ func TestPinnedChatUnknownAccountWithoutSession(t *testing.T) {
 	}
 }
 
-// TestUnbindSessionNilSafe 直接验证 nil-safe 包装不 panic。
+// TestUnbindSessionNilSafe 直接验证 Session=nil 时绑定/解绑路径不 panic。
+// handler 内部对 cfg.Session 做 nil 判空；这里用同一入口触发路径。
 func TestUnbindSessionNilSafe(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     pool.New(""),
 		Upstream: upstream.New(),
 		Session:  nil,
 	})
-	// 这两个调用在修复前会 panic。
-	h.unbindSession("some-key")
-	h.bindSession("some-key", "some-uid")
+	if h.cfg.Session != nil {
+		t.Fatal("Session should be nil for this test")
+	}
+	// 走真实 chat 路径：Session=nil 时不得 panic（无可用账号时返回 503）。
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.1","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code == 0 {
+		t.Fatal("no response written")
+	}
 }

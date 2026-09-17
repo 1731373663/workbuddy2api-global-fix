@@ -18,7 +18,7 @@ import (
 // 背景（issue #41）：旧逻辑用 io.LimitReader(r.Body, 8<<20) 静默截断，半截 JSON
 // 发给上游触发 11101 unexpected EOF，网关却把它归为客户端错误罚号 + 轮转耗尽 503
 // —— 根因在网关却让账号背锅。现在超限直接 413，且不打上游、不罚账号、不轮转。
-func TestChatOversizedBodyReturns413(t *testing.T) {
+func TestBodylimitOversizedBodyReturns413(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
@@ -56,7 +56,7 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 }
 
 // TestChatOversizedBodyDefaultLimit 未显式配置时兜底 8MB：8MB+1 必须 413。
-func TestChatOversizedBodyDefaultLimit(t *testing.T) {
+func TestBodylimitOversizedBodyDefaultLimit(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
@@ -115,7 +115,7 @@ func TestChatBodyAtLimitAllowed(t *testing.T) {
 //
 // 背景（issue #41 连带）：这本质是"发给上游的 body 有问题"，与账号健康无关；
 // 旧分类把它归为通用 ErrClient，一旦 body 同时命中限流文案还会被误判 soft_rate 罚号。
-func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
+func TestBodylimitBadParamsRotatesWithoutPenalty(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -152,7 +152,7 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 
 // TestChatAllBadParams503CarriesUpstreamBody 全部账号都返回 11101 时，
 // 503 文案必须带上上游原始信息（便于定位是客户端 body 问题）。
-func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+func TestBodylimitAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
 	})
@@ -221,16 +221,17 @@ func TestChatModelRateLimit6004FutureResetCooldown(t *testing.T) {
 		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatal("应处于冷却中")
+	// 6004 是模型级限流：账号级不进入冷却，只把该模型写入限流台账。
+	models := st.RateLimitedModels
+	if len(models) != 1 || models[0].Model != "glm-5.2" {
+		t.Errorf("应记录触发模型 glm-5.2, 得到 %+v", models)
 	}
-	// 冷却应≈90s（上游重置时间），而不是 600s 基数。
-	if st.CoolRemaining > 95 || st.CoolRemaining < 80 {
-		t.Errorf("冷却剩余 = %ds, 应接近上游重置时间 ~90s（而非基数 600s）", st.CoolRemaining)
-	}
-	// 触发模型应被记录（供换模型豁免）。
-	if model, isModel := p.ModelSoftCooldown("u1"); !isModel || model != "glm-5.2" {
-		t.Errorf("应记录触发模型 glm-5.2, 得到 %q (isModel=%v)", model, isModel)
+	// 台账冷却截止应≈上游重置时间（约 90s），而不是 600s 基数。
+	if len(models) == 1 {
+		remain := time.Until(models[0].Until)
+		if remain > 95*time.Second || remain < 80*time.Second {
+			t.Errorf("模型限流剩余 = %v, 应接近上游重置时间 ~90s", remain)
+		}
 	}
 }
 

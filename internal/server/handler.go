@@ -80,6 +80,8 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// respStore Responses 结果本地存储（store=true / previous_response_id）。
+	respStore *responsesStore
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
@@ -103,11 +105,13 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.respStore = newResponsesStore(responsesStoreMaxEntries, responsesStoreTTL)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// OpenAI Responses API 兼容层（Codex 等客户端默认走 /v1/responses）：
 	// 内部翻译成 Chat Completions，复用同一套选号/轮转/统计链路。
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/responses/{id}", h.withAuth(h.responsesGet))
+	h.mux.HandleFunc("DELETE /v1/responses/{id}", h.withAuth(h.responsesDelete))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
@@ -332,9 +336,9 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +

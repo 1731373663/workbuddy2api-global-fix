@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -35,19 +36,73 @@ func responsesNewID(prefix string) string {
 
 // responsesRequest 只解析适配层需要的字段，其余原样忽略。
 type responsesRequest struct {
-	Model             string            `json:"model"`
-	Input             json.RawMessage   `json:"input"`
-	Instructions      json.RawMessage   `json:"instructions"`
-	Stream            bool              `json:"stream"`
-	Tools             []json.RawMessage `json:"tools"`
-	ToolChoice        json.RawMessage   `json:"tool_choice"`
-	MaxOutputTokens   *int              `json:"max_output_tokens"`
-	Temperature       *float64          `json:"temperature"`
-	TopP              *float64          `json:"top_p"`
-	ParallelToolCalls *bool             `json:"parallel_tool_calls"`
-	Reasoning         json.RawMessage   `json:"reasoning"`
-	Text              json.RawMessage   `json:"text"`
-	PromptCacheKey    string            `json:"prompt_cache_key"`
+	Model              string            `json:"model"`
+	Input              json.RawMessage   `json:"input"`
+	Instructions       json.RawMessage   `json:"instructions"`
+	Stream             bool              `json:"stream"`
+	Tools              []json.RawMessage `json:"tools"`
+	ToolChoice         json.RawMessage   `json:"tool_choice"`
+	MaxOutputTokens    *int              `json:"max_output_tokens"`
+	Temperature        *float64          `json:"temperature"`
+	TopP               *float64          `json:"top_p"`
+	ParallelToolCalls  *bool             `json:"parallel_tool_calls"`
+	Reasoning          json.RawMessage   `json:"reasoning"`
+	Text               json.RawMessage   `json:"text"`
+	PromptCacheKey     string            `json:"prompt_cache_key"`
+	Store              *bool             `json:"store"`
+	PreviousResponseID string            `json:"previous_response_id"`
+	Metadata           map[string]any    `json:"metadata"`
+	Truncation         string            `json:"truncation"`
+	Include            []string          `json:"include"`
+	Background         *bool             `json:"background"`
+	ServiceTier        string            `json:"service_tier"`
+	MaxToolCalls       *int              `json:"max_tool_calls"`
+	SafetyIdentifier   string            `json:"safety_identifier"`
+	User               string            `json:"user"`
+
+	// baseMessages 转换后的出站 Chat messages（不含本轮 assistant 回复）。
+	// 本轮回复追加后写入本地 Responses 历史（previous_response_id）。
+	baseMessages []any `json:"-"`
+}
+
+// responsesUnsupportedError 明确的「本地适配层不支持」错误。
+// handler 据 Code 返回 unsupported_parameter，而不是静默丢弃字段。
+type responsesUnsupportedError struct {
+	Code    string
+	Message string
+}
+
+func (e *responsesUnsupportedError) Error() string { return e.Message }
+
+func unsupported(code, message string) error {
+	return &responsesUnsupportedError{Code: code, Message: message}
+}
+
+// validateResponsesRequest 明确拒绝本地适配层无法真实执行的语义。
+// 能本地模拟的字段（store/previous_response_id/metadata/truncation=auto）放行；
+// 上游没有执行器的字段立即报错，避免静默丢弃造成「看似成功」。
+func validateResponsesRequest(req *responsesRequest) error {
+	if req.Background != nil && *req.Background {
+		return unsupported("unsupported_parameter", "background=true is not supported by this gateway")
+	}
+	if req.MaxToolCalls != nil {
+		return unsupported("unsupported_parameter", "max_tool_calls is not supported by this gateway")
+	}
+	if req.Truncation != "" && req.Truncation != "disabled" && req.Truncation != "auto" {
+		return unsupported("unsupported_parameter", "truncation="+req.Truncation+" is not supported by this gateway")
+	}
+	if req.ServiceTier != "" && req.ServiceTier != "auto" && req.ServiceTier != "default" {
+		return unsupported("unsupported_parameter", "service_tier="+req.ServiceTier+" is not supported by this gateway")
+	}
+	for _, inc := range req.Include {
+		switch inc {
+		case "reasoning.encrypted_content":
+			// 本地 reasoning item 始终携带 encrypted_content 载体。
+		default:
+			return unsupported("unsupported_parameter", "include="+inc+" is not supported by this gateway")
+		}
+	}
+	return nil
 }
 
 // textFromContent 把 Responses 的 content（字符串或内容数组）压平成纯文本。
@@ -125,6 +180,33 @@ func reasoningItem(id, text, status string) map[string]any {
 	return item
 }
 
+// imagePartToChat converts a Responses input_image part to a Chat image_url
+// part. detail is preserved when present; image_url may be a string or object.
+func imagePartToChat(p map[string]any) (map[string]any, bool) {
+	url := ""
+	detail := ""
+	switch v := p["image_url"].(type) {
+	case string:
+		url = v
+	case map[string]any:
+		url, _ = v["url"].(string)
+		if d, ok := v["detail"].(string); ok {
+			detail = d
+		}
+	}
+	if url == "" {
+		return nil, false
+	}
+	if d, ok := p["detail"].(string); ok && d != "" {
+		detail = d
+	}
+	img := map[string]any{"url": url}
+	if detail != "" {
+		img["detail"] = detail
+	}
+	return map[string]any{"type": "image_url", "image_url": img}, true
+}
+
 // contentToChat 把 Responses 内容数组转成 Chat 的 content（纯文本或分段数组）。
 func contentToChat(raw json.RawMessage) any {
 	var s string
@@ -141,8 +223,8 @@ func contentToChat(raw json.RawMessage) any {
 		case "input_text", "output_text", "text":
 			out = append(out, map[string]any{"type": "text", "text": p["text"]})
 		case "input_image":
-			if u, ok := p["image_url"].(string); ok && u != "" {
-				out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+			if part, ok := imagePartToChat(p); ok {
+				out = append(out, part)
 			}
 		}
 	}
@@ -182,16 +264,8 @@ func toolOutputToChat(v any) any {
 					out = append(out, map[string]any{"type": "text", "text": text})
 				}
 			case "input_image":
-				url := ""
-				if u, ok := p["image_url"].(string); ok {
-					url = u
-				} else if m, ok := p["image_url"].(map[string]any); ok {
-					url, _ = m["url"].(string)
-				}
-				if url != "" {
-					out = append(out, map[string]any{
-						"type": "image_url", "image_url": map[string]any{"url": url},
-					})
+				if part, ok := imagePartToChat(p); ok {
+					out = append(out, part)
 				}
 			}
 		}
@@ -232,7 +306,14 @@ func stringifyOutput(v any) string {
 }
 
 // responsesToChat 把 Responses 请求体翻译成 Chat Completions 请求体。
+// 兼容入口：无本地历史时等价 responsesToChatWithHistory(body, nil)。
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
+	return responsesToChatWithHistory(body, nil)
+}
+
+// responsesToChatWithHistory 在转换前把 previous_response_id 对应的历史
+// Chat messages 前置到本轮消息之前。prior 为 nil 时行为与旧实现完全一致。
+func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesRequest, error) {
 	var req responsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, nil, fmt.Errorf("parse responses request: %w", err)
@@ -240,8 +321,27 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if strings.TrimSpace(req.Model) == "" {
 		return nil, nil, fmt.Errorf("missing required field: model")
 	}
+	if err := validateResponsesRequest(&req); err != nil {
+		return nil, nil, err
+	}
 	chat := map[string]any{"model": req.Model}
-	messages := make([]any, 0, 8)
+	messages := make([]any, 0, 8+len(prior))
+
+	// previous_response_id：前置上一轮历史（含 assistant 回复）。
+	// 上游无状态，历史必须随本轮请求重放；本地拼接只补协议语义，不减少上游 token。
+	// 过滤 system/developer：本轮会按 instructions/消息重新生成系统提示词，
+	// 若把历史 system 一并回放，多轮后系统提示词会重复累积、放大 token。
+	for _, m := range prior {
+		msg, _ := m.(map[string]any)
+		if msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role == "system" || role == "developer" {
+			continue
+		}
+		messages = append(messages, m)
+	}
 
 	// instructions → system 消息
 	if len(req.Instructions) > 0 {
@@ -357,6 +457,7 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	}
 	flushAssistant()
 	chat["messages"] = messages
+	req.baseMessages = messages
 
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
@@ -503,6 +604,78 @@ func responsesEnvelope(id, model, status string, output []any, usage map[string]
 	}
 }
 
+// responsesStoreRequested 判断请求是否要求本地保存响应。
+// store 未传时按 OpenAI 默认（false）处理，避免默认放大内存占用。
+func responsesStoreRequested(req *responsesRequest) bool {
+	return req != nil && req.Store != nil && *req.Store
+}
+
+// applyResponsesEcho 把请求里的可回显字段写回最终 Response 对象。
+// 上游不参与这些字段，回显是为了让客户端看到的 Response 与其请求一致。
+func applyResponsesEcho(env map[string]any, req *responsesRequest) {
+	if env == nil || req == nil {
+		return
+	}
+	if req.Metadata != nil {
+		env["metadata"] = req.Metadata
+	} else {
+		env["metadata"] = map[string]any{}
+	}
+	env["store"] = responsesStoreRequested(req)
+	if req.Truncation != "" {
+		env["truncation"] = req.Truncation
+	} else {
+		env["truncation"] = "disabled"
+	}
+	if req.PreviousResponseID != "" {
+		env["previous_response_id"] = req.PreviousResponseID
+	} else {
+		env["previous_response_id"] = nil
+	}
+	if len(req.Tools) > 0 {
+		tools := make([]any, 0, len(req.Tools))
+		for _, raw := range req.Tools {
+			var t map[string]any
+			if json.Unmarshal(raw, &t) == nil {
+				tools = append(tools, t)
+			}
+		}
+		env["tools"] = tools
+	} else {
+		env["tools"] = []any{}
+	}
+	if len(req.ToolChoice) > 0 {
+		var tc any
+		if json.Unmarshal(req.ToolChoice, &tc) == nil {
+			env["tool_choice"] = tc
+		}
+	}
+	if req.ParallelToolCalls != nil {
+		env["parallel_tool_calls"] = *req.ParallelToolCalls
+	}
+	if req.Temperature != nil {
+		env["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		env["top_p"] = *req.TopP
+	}
+	if len(req.Reasoning) > 0 {
+		var r any
+		if json.Unmarshal(req.Reasoning, &r) == nil {
+			env["reasoning"] = r
+		}
+	}
+	if req.MaxOutputTokens != nil {
+		env["max_output_tokens"] = *req.MaxOutputTokens
+	}
+	if req.User != "" {
+		env["user"] = req.User
+	}
+	if req.SafetyIdentifier != "" {
+		env["safety_identifier"] = req.SafetyIdentifier
+	}
+}
+
 // responsesMessageItem 构造 assistant message output item。
 func responsesMessageItem(id, text string, status string) map[string]any {
 	return map[string]any{
@@ -527,10 +700,35 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("请求体超过 %d MB 上限", limit>>20))
 		return
 	}
-	chatBody, meta, err := responsesToChat(body)
+	// previous_response_id：先解析顶层字段，命中本地历史再拼接。
+	var peek responsesRequest
+	if err := json.Unmarshal(body, &peek); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "parse responses request: "+err.Error())
+		return
+	}
+	var prior []any
+	if peek.PreviousResponseID != "" {
+		var ok bool
+		_, prior, ok = h.respStore.Get(peek.PreviousResponseID)
+		if !ok {
+			writeOpenAIError(w, http.StatusNotFound, "not_found",
+				"previous_response_id not found: "+peek.PreviousResponseID)
+			return
+		}
+	}
+	chatBody, meta, err := responsesToChatWithHistory(body, prior)
 	if err != nil {
+		var ue *responsesUnsupportedError
+		if errors.As(err, &ue) {
+			writeOpenAIError(w, http.StatusBadRequest, ue.Code, ue.Message)
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	var base []any
+	if meta != nil && len(meta.baseMessages) > 0 {
+		base = meta.baseMessages
 	}
 	// 复用 chatCompletions：替换 body，保持同一请求上下文（断连取消）。
 	inner := r.Clone(r.Context())
@@ -539,13 +737,105 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 
 	if meta.Stream {
 		proxy := newResponsesStreamProxy(w, meta)
+		proxy.baseMessages = base
 		h.chatCompletions(proxy, inner)
 		proxy.finish()
+		h.saveResponsesResult(meta, proxy, base)
 		return
 	}
 	rec := newResponsesCapture()
 	h.chatCompletions(rec, inner)
-	responsesWriteNonStream(w, meta, rec)
+	env := responsesWriteNonStream(w, meta, rec)
+	if env != nil {
+		h.saveResponsesEnvelope(meta, env, base)
+	}
+}
+
+// saveResponsesResult 在流式结束后按 store=true 保存最终 Response 对象。
+func (h *Handler) saveResponsesResult(meta *responsesRequest, proxy *responsesStreamProxy, base []any) {
+	if !responsesStoreRequested(meta) || proxy == nil || proxy.finalEnvelope == nil {
+		return
+	}
+	h.saveResponsesEnvelope(meta, proxy.finalEnvelope, base)
+}
+
+// saveResponsesEnvelope 保存 Response 对象与下一轮所需的 Chat messages。
+// messages = 本轮出站 messages + 本轮 assistant 回复（文本与 tool_calls 合并为同一条）。
+func (h *Handler) saveResponsesEnvelope(meta *responsesRequest, env map[string]any, base []any) {
+	if h.respStore == nil || !responsesStoreRequested(meta) || env == nil {
+		return
+	}
+	id, _ := env["id"].(string)
+	if id == "" {
+		return
+	}
+	msgs := append([]any{}, base...)
+	if out, ok := env["output"].([]any); ok {
+		if msg := assistantMessageFromOutput(out); msg != nil {
+			msgs = append(msgs, msg)
+		}
+	}
+	h.respStore.Put(id, env, msgs)
+}
+
+// assistantMessageFromOutput 把 Responses output 里的 assistant 文本与 function_call
+// 合并为一条 Chat assistant 消息（深寻思考模式要求带 tool_calls 的消息同时有 content
+// 与 reasoning 关联；这里保留 content=tool_calls 的配对语义）。两者都无 → nil。
+func assistantMessageFromOutput(output []any) map[string]any {
+	var text strings.Builder
+	var calls []any
+	for _, item := range output {
+		m, _ := item.(map[string]any)
+		if m == nil {
+			continue
+		}
+		switch m["type"] {
+		case "message":
+			text.WriteString(outputMessageText(m))
+		case "function_call":
+			callID, _ := m["call_id"].(string)
+			if callID == "" {
+				callID, _ = m["id"].(string)
+			}
+			name, _ := m["name"].(string)
+			args, _ := m["arguments"].(string)
+			calls = append(calls, map[string]any{
+				"id": callID, "type": "function",
+				"function": map[string]any{"name": name, "arguments": args},
+			})
+		}
+	}
+	if len(calls) == 0 && text.Len() == 0 {
+		return nil
+	}
+	msg := map[string]any{"role": "assistant"}
+	if s := text.String(); s != "" {
+		msg["content"] = s
+	} else {
+		msg["content"] = nil
+	}
+	if len(calls) > 0 {
+		msg["tool_calls"] = calls
+	}
+	return msg
+}
+
+// outputMessageText 提取 Responses message item 的纯文本。
+func outputMessageText(item map[string]any) string {
+	content, _ := item["content"].([]any)
+	var b strings.Builder
+	for _, part := range content {
+		p, _ := part.(map[string]any)
+		if p == nil {
+			continue
+		}
+		if t, _ := p["type"].(string); t == "output_text" {
+			if s, ok := p["text"].(string); ok {
+				b.WriteString(s)
+			}
+		}
+	}
+	return b.String()
 }
 
 // responsesCapture 缓冲 chatCompletions 的非流式输出。
@@ -572,27 +862,29 @@ func (c *responsesCapture) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
-// responsesWriteNonStream 把 Chat 聚合响应翻译成 Responses 响应。
-func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec *responsesCapture) {
+// responsesWriteNonStream 把 Chat 聚合响应翻译成 Responses 响应，并返回 Response 对象。
+func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec *responsesCapture) map[string]any {
 	status := rec.status
 	if status == 0 {
 		status = http.StatusOK
 	}
 	if status >= 400 {
 		writeOpenAIError(w, status, "upstream_error", strings.TrimSpace(rec.buf.String()))
-		return
+		return nil
 	}
 	var chat map[string]any
 	if err := json.Unmarshal(rec.buf.Bytes(), &chat); err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-		return
+		return nil
 	}
 	respID := responsesNewID("resp")
 	var text strings.Builder
 	var reasoning strings.Builder
+	finishReason := ""
 	output := make([]any, 0, 4)
 	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
 		if c, ok := choices[0].(map[string]any); ok {
+			finishReason, _ = c["finish_reason"].(string)
 			if msg, ok := c["message"].(map[string]any); ok {
 				if v, ok := msg["reasoning_content"].(string); ok && v != "" {
 					reasoning.WriteString(v)
@@ -633,9 +925,18 @@ func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec 
 	if u, ok := chat["usage"].(map[string]any); ok {
 		usage = ParseUsage(u)
 	}
-	env := responsesEnvelope(respID, meta.Model, "completed", output, usageToResponses(usage))
+	respStatus := "completed"
+	if finishReason == "length" {
+		respStatus = "incomplete"
+	}
+	env := responsesEnvelope(respID, meta.Model, respStatus, output, usageToResponses(usage))
 	env["output_text"] = text.String()
+	applyResponsesEcho(env, meta)
+	if respStatus == "incomplete" {
+		env["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
 	writeJSON(w, http.StatusOK, env)
+	return env
 }
 
 // responsesCall 单个 function_call 的累计状态。
@@ -681,6 +982,14 @@ type responsesStreamProxy struct {
 	usage    *UsageDetail
 	hadError bool
 	errMsg   string
+	// finishReason 上游末帧 finish_reason（stop/length/tool_calls）。
+	// length 时最终状态必须是 incomplete，不能谎报 completed。
+	finishReason string
+
+	// finalEnvelope 最终 Response 对象（finish 时写入，供 store=true 保存）。
+	finalEnvelope map[string]any
+	// baseMessages 本轮出站 Chat messages（不含 assistant 回复）。
+	baseMessages []any
 }
 
 func newResponsesStreamProxy(dest http.ResponseWriter, meta *responsesRequest) *responsesStreamProxy {
@@ -760,6 +1069,9 @@ func (p *responsesStreamProxy) handleChunk(payload string) {
 	c, _ := choices[0].(map[string]any)
 	if c == nil {
 		return
+	}
+	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+		p.finishReason = fr
 	}
 	if delta, ok := c["delta"].(map[string]any); ok {
 		if v, ok := delta["reasoning_content"].(string); ok && v != "" {
@@ -928,11 +1240,7 @@ func (p *responsesStreamProxy) finish() {
 			"response": responsesEnvelope(p.respID, p.meta.Model, "in_progress", nil, nil),
 		})
 		p.emit("response.failed", map[string]any{
-			"response": map[string]any{
-				"id": p.respID, "object": "response", "status": "failed",
-				"model": p.meta.Model, "output": []any{},
-				"error": map[string]any{"code": "server_error", "message": msg},
-			},
+			"response": failedResponsesEnvelope(p.respID, p.meta, msg),
 		})
 		return
 	}
@@ -1002,11 +1310,54 @@ func (p *responsesStreamProxy) finish() {
 		item := responsesMessageItem(responsesNewID("msg"), "", "completed")
 		output = append(output, item)
 	}
-	env := responsesEnvelope(p.respID, p.meta.Model, "completed", output, usageToResponses(p.usage))
+	respStatus := "completed"
+	if p.finishReason == "length" {
+		respStatus = "incomplete"
+	}
+	env := responsesEnvelope(p.respID, p.meta.Model, respStatus, output, usageToResponses(p.usage))
+	applyResponsesEcho(env, p.meta)
+	if respStatus == "incomplete" {
+		env["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	p.finalEnvelope = env
+	if respStatus == "incomplete" {
+		p.emit("response.incomplete", map[string]any{"response": env})
+		return
+	}
 	p.emit("response.completed", map[string]any{"response": env})
 }
 
-// responsesGet 网关不保存会话状态；返回 404 由客户端按 unsupported 处理。
+// failedResponsesEnvelope 构造完整的失败 Response 对象。
+// 旧实现只回六个字段；这里复用完整 envelope 再覆盖状态与错误，
+// 客户端仍能拿到请求相关的 metadata/store 回显。
+func failedResponsesEnvelope(id string, meta *responsesRequest, msg string) map[string]any {
+	model := ""
+	if meta != nil {
+		model = meta.Model
+	}
+	env := responsesEnvelope(id, model, "failed", []any{}, nil)
+	env["error"] = map[string]any{"code": "server_error", "message": msg}
+	applyResponsesEcho(env, meta)
+	return env
+}
+
+// responsesGet 返回本地保存的 Response；未保存/已过期返回 404。
 func (h *Handler) responsesGet(w http.ResponseWriter, r *http.Request) {
-	writeOpenAIError(w, http.StatusNotFound, "not_found", "response state is not stored by this gateway")
+	id := r.PathValue("id")
+	env, _, ok := h.respStore.Get(id)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "response not found: "+id)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+// responsesDelete 删除本地保存的 Response；未找到返回 404。
+func (h *Handler) responsesDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !h.respStore.Delete(id) {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "response not found: "+id)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 }

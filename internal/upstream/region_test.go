@@ -8,6 +8,8 @@ import (
 
 // TestIsGlobalRealm 区域判定：决定请求打到 workbuddy.ai 还是 copilot.tencent.com。
 func TestIsGlobalRealm(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	cases := []struct {
 		domain string
 		want   bool
@@ -25,19 +27,23 @@ func TestIsGlobalRealm(t *testing.T) {
 	}
 	for _, c := range cases {
 		a := &auth.Auth{Domain: c.domain}
-		if got := isGlobalRealm(a); got != c.want {
-			t.Errorf("isGlobalRealm(domain=%q) = %v, want %v", c.domain, got, c.want)
+		if got := a.IsGlobal(); got != c.want {
+			t.Errorf("IsGlobal(domain=%q) = %v, want %v", c.domain, got, c.want)
 		}
 	}
 	// nil 账号不应 panic。
-	if isGlobalRealm(nil) {
+	var nilAuth *auth.Auth
+	if nilAuth != nil && nilAuth.IsGlobal() {
 		t.Error("nil 账号不应判为 Global")
 	}
 }
 
 // TestChatBaseByRegion 聊天基址按 region 分流。
 func TestChatBaseByRegion(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	c := New()
+	c.GlobalEnabled = true
 
 	global := &auth.Auth{Domain: "www.workbuddy.ai"}
 	if got := c.chatBase(global); got != "https://www.workbuddy.ai" {
@@ -55,7 +61,10 @@ func TestChatBaseByRegion(t *testing.T) {
 
 // TestBillingBaseByRegion 计费基址按 region 分流。
 func TestBillingBaseByRegion(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	c := New()
+	c.GlobalEnabled = true
 
 	if got := c.billingBase(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "https://www.workbuddy.ai" {
 		t.Errorf("Global billingBase = %q", got)

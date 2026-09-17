@@ -226,6 +226,49 @@ func TestResponsesToolOutputRawDataURLImageStaysMultimodal(t *testing.T) {
 	}
 }
 
+// TestResponsesImageDetailPreserved verifies detail and object-shaped
+// image_url survive the Responses -> Chat translation.
+func TestResponsesImageDetailPreserved(t *testing.T) {
+	dataURL := "data:image/png;base64," + strings.Repeat("A", 64)
+	body, err := json.Marshal(map[string]any{
+		"model": "cn:deepseek-v4.1-flash",
+		"input": []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "look"},
+				map[string]any{"type": "input_image", "image_url": dataURL, "detail": "high"},
+				map[string]any{"type": "input_image", "image_url": map[string]any{
+					"url": dataURL, "detail": "low",
+				}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	msg, _ := msgs[0].(map[string]any)
+	parts, _ := msg["content"].([]any)
+	if len(parts) != 3 {
+		t.Fatalf("content parts=%d want 3: %v", len(parts), parts)
+	}
+	for i, want := range []string{"high", "low"} {
+		p, _ := parts[i+1].(map[string]any)
+		iu, _ := p["image_url"].(map[string]any)
+		if iu["detail"] != want {
+			t.Fatalf("part %d detail=%v want %s: %v", i+1, iu["detail"], want, iu)
+		}
+	}
+}
+
 // TestResponsesReasoningMergedIntoAssistant DeepSeek 思考模式：reasoning item 的
 // 文本必须回填到带 tool_calls 的 assistant 消息，避免 11155 reasoning_content_missing。
 func TestResponsesReasoningMergedIntoAssistant(t *testing.T) {
