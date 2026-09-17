@@ -207,6 +207,13 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 		}
+		// WAF 冷却号不参与兜底：WAF 403 拦的是出口 IP + 请求指纹，换账号/重试都在
+		// 同一 IP 上，必然再次命中。把冷却中的号选回来重试，只会把一次客户端请求
+		// 放大成多次 WAF 命中（实测一次对话触发 6 次拦截、14 次兜底重选），让冷却
+		// 越滚越长并加重风控。此处置为不可兜底，交给冷却窗口自然滑过。
+		if e.reason == "waf 403 block" && !e.until.IsZero() && now.Before(e.until) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
