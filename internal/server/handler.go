@@ -112,6 +112,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/responses/{id}", h.withAuth(h.responsesGet))
 	h.mux.HandleFunc("DELETE /v1/responses/{id}", h.withAuth(h.responsesDelete))
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.anthropicCountTokens))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
@@ -159,11 +161,21 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey != "" {
 			authz := r.Header.Get("Authorization")
+			// Claude Code 使用 Anthropic 协议：认证头是 x-api-key，而不是
+			// Authorization: Bearer。仅对 /v1/messages* 放宽为同时接受两种头；
+			// OpenAI/Responses 路由保持原有 Bearer 语义不变。
+			provided := ""
+			ok := false
+			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+				provided = strings.TrimSpace(r.Header.Get("x-api-key"))
+				ok = provided != ""
+			} else {
+				provided = strings.TrimPrefix(authz, "Bearer ")
+				ok = strings.HasPrefix(authz, "Bearer ")
+			}
 			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
 			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
-			provided := strings.TrimPrefix(authz, "Bearer ")
-			if !strings.HasPrefix(authz, "Bearer ") ||
-				subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
+			if !ok || subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}
