@@ -34,6 +34,42 @@ func responsesNewID(prefix string) string {
 	return fmt.Sprintf("%s_%d%06d", prefix, time.Now().UnixNano(), responsesSeq.Add(1)%1000000)
 }
 
+const encodedToolNamePrefix = "codex_tool_"
+
+func isSafeToolName(name string) bool {
+	if name == "" || strings.HasPrefix(name, encodedToolNamePrefix) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// encodeToolName rewrites a Codex tool name into the conservative function-name
+// alphabet accepted by the Chat upstream. Unsafe names are base64url encoded
+// behind a marker, which keeps the mapping reversible and collision-free.
+func encodeToolName(name string) string {
+	if isSafeToolName(name) {
+		return name
+	}
+	return encodedToolNamePrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+func decodeToolName(name string) string {
+	if strings.HasPrefix(name, encodedToolNamePrefix) {
+		raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(name, encodedToolNamePrefix))
+		if err == nil {
+			return string(raw)
+		}
+	}
+	return name
+}
+
 // responsesRequest 只解析适配层需要的字段，其余原样忽略。
 type responsesRequest struct {
 	Model              string            `json:"model"`
@@ -305,6 +341,56 @@ func stringifyOutput(v any) string {
 	}
 }
 
+// convertResponsesTool converts one Responses API tool declaration into a Chat
+// Completions function declaration. Custom/freeform tools are exposed as a
+// function with a single `input` string, which is the closest lossless shape.
+func convertResponsesTool(t map[string]any) map[string]any {
+	if t == nil {
+		return nil
+	}
+	name, _ := t["name"].(string)
+	if name == "" {
+		return nil
+	}
+	if ns, _ := t["namespace"].(string); ns != "" {
+		name = ns + "." + name
+	}
+	name = encodeToolName(name)
+	typ, _ := t["type"].(string)
+	fn := map[string]any{"name": name}
+	if v, ok := t["description"]; ok {
+		fn["description"] = v
+	}
+	switch typ {
+	case "function", "":
+		for _, k := range []string{"parameters", "strict"} {
+			if v, ok := t[k]; ok {
+				fn[k] = v
+			}
+		}
+	case "custom":
+		fn["parameters"] = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"input": map[string]any{"type": "string", "description": "Raw tool input"},
+			},
+			"required":             []any{"input"},
+			"additionalProperties": false,
+		}
+	case "tool_search":
+		if v, ok := t["parameters"]; ok {
+			fn["parameters"] = v
+		}
+		fn["strict"] = false
+	default:
+		return nil
+	}
+	if fn["parameters"] == nil {
+		fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
+	}
+	return map[string]any{"type": "function", "function": fn}
+}
+
 // responsesToChat 把 Responses 请求体翻译成 Chat Completions 请求体。
 // 兼容入口：无本地历史时等价 responsesToChatWithHistory(body, nil)。
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
@@ -357,6 +443,7 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 	var pendingReasoning strings.Builder
 	var pendingAssistant strings.Builder
 	var pendingCalls []any
+	var discoveredTools []any
 	flushAssistant := func() {
 		text := pendingAssistant.String()
 		hasCalls := len(pendingCalls) > 0
@@ -401,16 +488,54 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 					callID, _ = it["id"].(string)
 				}
 				name, _ := it["name"].(string)
+				name = encodeToolName(name)
 				args, _ := it["arguments"].(string)
 				pendingCalls = append(pendingCalls, map[string]any{
 					"id": callID, "type": "function",
 					"function": map[string]any{"name": name, "arguments": args},
+				})
+			case "tool_search_call":
+				callID, _ := it["call_id"].(string)
+				if callID == "" {
+					callID, _ = it["id"].(string)
+				}
+				args := "{}"
+				switch v := it["arguments"].(type) {
+				case string:
+					if v != "" {
+						args = v
+					}
+				case nil:
+				default:
+					if raw, err := json.Marshal(v); err == nil {
+						args = string(raw)
+					}
+				}
+				pendingCalls = append(pendingCalls, map[string]any{
+					"id": callID, "type": "function",
+					"function": map[string]any{"name": "tool_search", "arguments": args},
 				})
 			case "function_call_output":
 				flushAssistant()
 				callID, _ := it["call_id"].(string)
 				messages = append(messages, map[string]any{
 					"role": "tool", "tool_call_id": callID, "content": toolOutputToChat(it["output"]),
+				})
+			case "tool_search_output":
+				flushAssistant()
+				callID, _ := it["call_id"].(string)
+				if callID == "" {
+					callID, _ = it["id"].(string)
+				}
+				payload := it["tools"]
+				if payload == nil {
+					payload = it["output"]
+				}
+				if rawTools, ok := payload.([]any); ok {
+					discoveredTools = append(discoveredTools, rawTools...)
+				}
+				messages = append(messages, map[string]any{
+					"role": "tool", "tool_call_id": callID, "content": stringifyOutput(payload),
 				})
 			default:
 				role, _ := it["role"].(string)
@@ -461,24 +586,81 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
+		seenTools := map[string]bool{}
+		appendTool := func(tool map[string]any) {
+			name, _ := tool["name"].(string)
+			if name == "" {
+				return
+			}
+			if ns, _ := tool["namespace"].(string); ns != "" {
+				name = ns + "." + name
+			}
+			if seenTools[name] {
+				return
+			}
+			seenTools[name] = true
+			if fn := convertResponsesTool(tool); fn != nil {
+				tools = append(tools, fn)
+			}
+		}
 		for _, raw := range req.Tools {
 			var t map[string]any
 			if json.Unmarshal(raw, &t) != nil {
 				continue
 			}
-			if typ, _ := t["type"].(string); typ != "function" && typ != "" {
-				continue // 网关只支持 function 类工具
-			}
-			fn := map[string]any{}
-			for _, k := range []string{"name", "description", "parameters", "strict"} {
-				if v, ok := t[k]; ok {
-					fn[k] = v
+			typ, _ := t["type"].(string)
+			switch typ {
+			case "namespace":
+				ns, _ := t["name"].(string)
+				children, _ := t["tools"].([]any)
+				for _, rawChild := range children {
+					child, _ := rawChild.(map[string]any)
+					if child == nil {
+						continue
+					}
+					clone := make(map[string]any, len(child)+1)
+					for k, v := range child {
+						clone[k] = v
+					}
+					if _, ok := clone["namespace"]; !ok && ns != "" {
+						clone["namespace"] = ns
+					}
+					appendTool(clone)
 				}
+			case "tool_search":
+				search := map[string]any{
+					"type":        "function",
+					"name":        "tool_search",
+					"description": t["description"],
+					"parameters":  t["parameters"],
+					"strict":      false,
+				}
+				appendTool(search)
+			default:
+				appendTool(t)
 			}
-			if fn["name"] == nil {
+		}
+		for _, discovered := range discoveredTools {
+			found, _ := discovered.(map[string]any)
+			if found == nil {
 				continue
 			}
-			tools = append(tools, map[string]any{"type": "function", "function": fn})
+			ns, _ := found["name"].(string)
+			children, _ := found["tools"].([]any)
+			for _, rawChild := range children {
+				child, _ := rawChild.(map[string]any)
+				if child == nil {
+					continue
+				}
+				clone := make(map[string]any, len(child)+1)
+				for k, v := range child {
+					clone[k] = v
+				}
+				if _, ok := clone["namespace"]; !ok && ns != "" {
+					clone["namespace"] = ns
+				}
+				appendTool(clone)
+			}
 		}
 		if len(tools) > 0 {
 			chat["tools"] = tools
@@ -684,6 +866,28 @@ func responsesMessageItem(id, text string, status string) map[string]any {
 		"status":  status,
 		"role":    "assistant",
 		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+	}
+}
+
+func responsesToolCallItem(id, callID, name, args, status string) map[string]any {
+	name = decodeToolName(name)
+	if name == "tool_search" {
+		var arguments any
+		if args == "" || json.Unmarshal([]byte(args), &arguments) != nil {
+			arguments = map[string]any{}
+		}
+		return map[string]any{
+			"type":      "tool_search_call",
+			"id":        id,
+			"call_id":   callID,
+			"status":    status,
+			"execution": "client",
+			"arguments": arguments,
+		}
+	}
+	return map[string]any{
+		"type": "function_call", "id": id, "call_id": callID,
+		"name": name, "arguments": args, "status": status,
 	}
 }
 
@@ -905,11 +1109,9 @@ func responsesWriteNonStream(w http.ResponseWriter, meta *responsesRequest, rec 
 						if callID == "" {
 							callID = responsesNewID("call")
 						}
-						output = append(output, map[string]any{
-							"type": "function_call", "id": responsesNewID("fc"),
-							"call_id": callID, "name": name, "arguments": args,
-							"status": "completed",
-						})
+						output = append(output, responsesToolCallItem(
+							responsesNewID("fc"), callID, name, args, "completed",
+						))
 					}
 				}
 			}
@@ -1192,27 +1394,27 @@ func (p *responsesStreamProxy) appendToolCalls(tcs []any) {
 			if v, ok := fn["name"].(string); ok && v != "" {
 				call.name = v
 			}
-			// 首见即宣告 item（即使参数分片尚未到达），避免无参工具丢失。
-			if !call.added {
-				call.added = true
+			if call.id == "" {
 				call.id = responsesNewID("fc")
-				if call.callID == "" {
-					call.callID = responsesNewID("call")
-				}
+			}
+			if call.callID == "" {
+				call.callID = responsesNewID("call")
+			}
+			if call.name != "" && !call.added {
+				call.added = true
 				call.index = p.allocIndex()
 				p.emit("response.output_item.added", map[string]any{
 					"output_index": call.index,
-					"item": map[string]any{
-						"type": "function_call", "id": call.id, "call_id": call.callID,
-						"name": call.name, "arguments": "", "status": "in_progress",
-					},
+					"item":         responsesToolCallItem(call.id, call.callID, call.name, "", "in_progress"),
 				})
 			}
 			if v, ok := fn["arguments"].(string); ok && v != "" {
 				call.args.WriteString(v)
-				p.emit("response.function_call_arguments.delta", map[string]any{
-					"item_id": call.id, "output_index": call.index, "delta": v,
-				})
+				if call.added && decodeToolName(call.name) != "tool_search" {
+					p.emit("response.function_call_arguments.delta", map[string]any{
+						"item_id": call.id, "output_index": call.index, "delta": v,
+					})
+				}
 			}
 		}
 	}
@@ -1287,22 +1489,19 @@ func (p *responsesStreamProxy) finish() {
 		if !call.added {
 			call.added = true
 			call.index = p.allocIndex()
+			item := responsesToolCallItem(call.id, call.callID, call.name, "", "in_progress")
 			p.emit("response.output_item.added", map[string]any{
 				"output_index": call.index,
-				"item": map[string]any{
-					"type": "function_call", "id": call.id, "call_id": call.callID,
-					"name": call.name, "arguments": "", "status": "in_progress",
-				},
+				"item":         item,
 			})
 		}
 		args := call.args.String()
-		p.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": call.id, "output_index": call.index, "arguments": args,
-		})
-		item := map[string]any{
-			"type": "function_call", "id": call.id, "call_id": call.callID,
-			"name": call.name, "arguments": args, "status": "completed",
+		if decodeToolName(call.name) != "tool_search" {
+			p.emit("response.function_call_arguments.done", map[string]any{
+				"item_id": call.id, "output_index": call.index, "arguments": args,
+			})
 		}
+		item := responsesToolCallItem(call.id, call.callID, call.name, args, "completed")
 		p.emit("response.output_item.done", map[string]any{"output_index": call.index, "item": item})
 		output = append(output, item)
 	}

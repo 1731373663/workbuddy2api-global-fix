@@ -408,3 +408,140 @@ func TestReasoningCarrierRoundTrip(t *testing.T) {
 		t.Errorf("round trip: got %q want %q", got, text)
 	}
 }
+func TestResponsesWriteNonStreamToolSearch(t *testing.T) {
+	chat := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_search",
+					"function": map[string]any{
+						"name": "tool_search", "arguments": `{"query":"cua_repl js","limit":2}`,
+					},
+				}},
+			},
+		}},
+	}
+	raw, _ := json.Marshal(chat)
+	rec := newResponsesCapture()
+	rec.WriteHeader(200)
+	_, _ = rec.Write(raw)
+	dest := httptest.NewRecorder()
+	responsesWriteNonStream(dest, &responsesRequest{Model: "global:deepseek-v4.1-flash"}, rec)
+
+	var env map[string]any
+	if err := json.Unmarshal(dest.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal responses: %v", err)
+	}
+	output, _ := env["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "tool_search_call" || item["call_id"] != "call_search" || item["execution"] != "client" {
+		t.Fatalf("tool_search item wrong: %v", item)
+	}
+	args, ok := item["arguments"].(map[string]any)
+	if !ok || args["query"] != "cua_repl js" || args["limit"] != float64(2) {
+		t.Fatalf("tool_search arguments must be an object: %#v", item["arguments"])
+	}
+}
+
+// TestResponsesToolSearchOutputRoundTrip verifies Codex's tool_search result can
+// be replayed to the Chat-only upstream as a normal tool message.
+
+func TestResponsesToolSearchOutputRoundTrip(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":"find cua"},
+			{"type":"tool_search_call","call_id":"call_search","execution":"client","arguments":{"query":"cua_repl js"}},
+			{"type":"tool_search_output","call_id":"call_search","execution":"client","status":"completed","tools":[{"type":"function","name":"cua_repl.js"}]}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%v", msgs)
+	}
+	asst, _ := msgs[1].(map[string]any)
+	calls, _ := asst["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("tool_calls=%v", asst["tool_calls"])
+	}
+	call, _ := calls[0].(map[string]any)
+	fn, _ := call["function"].(map[string]any)
+	if fn["name"] != "tool_search" || fn["arguments"] != `{"query":"cua_repl js"}` {
+		t.Fatalf("tool_search call wrong: %v", call)
+	}
+	tool, _ := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_search" {
+		t.Fatalf("tool result wrong: %v", tool)
+	}
+	if content, _ := tool["content"].(string); content == "" {
+		t.Fatalf("tool result content empty: %v", tool)
+	}
+}
+
+// TestResponsesToolSearchOutputToolsBecomeCallable verifies that namespace
+// definitions returned by tool_search are appended to the upstream Chat tools,
+// so a deferred MCP tool can be called on the following model turn.
+
+func TestResponsesToolSearchOutputToolsBecomeCallable(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":"find cua"},
+			{"type":"tool_search_call","call_id":"call_search","execution":"client","arguments":{"query":"cua_repl js"}},
+			{"type":"tool_search_output","call_id":"call_search","execution":"client","status":"completed","tools":[{"type":"namespace","name":"mcp__cua_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}]}]}
+		],
+		"tools":[{"type":"tool_search","execution":"client","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools, _ := chat["tools"].([]any)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		names = append(names, name)
+	}
+	found := false
+	for _, name := range names {
+		if decodeToolName(name) == "mcp__cua_repl.js" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("discovered namespace tool missing from upstream tools: %v", names)
+	}
+}
+
+func TestEncodeToolNameRoundTrip(t *testing.T) {
+	for _, original := range []string{"tool_search", "mcp__cua_repl.js", "mcp__foo-bar"} {
+		encoded := encodeToolName(original)
+		if original == "tool_search" && encoded != original {
+			t.Fatalf("safe tool name changed: %q", encoded)
+		}
+		if got := decodeToolName(encoded); got != original {
+			t.Fatalf("round trip %q -> %q -> %q", original, encoded, got)
+		}
+	}
+}
+
+// TestResponsesReasoningMergedIntoAssistant DeepSeek 思考模式：reasoning item 的
+// 文本必须回填到带 tool_calls 的 assistant 消息，避免 11155 reasoning_content_missing。
