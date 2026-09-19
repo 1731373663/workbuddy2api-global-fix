@@ -587,6 +587,20 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
 		seenTools := map[string]bool{}
+		// When the client advertises tool_search, keep namespace children out of
+		// the first upstream turn. Codex expects the model to discover deferred
+		// MCP tools through tool_search and rejects a direct call to a tool that
+		// has not been returned by tool_search_output as "unsupported call".
+		hasToolSearch := false
+		for _, raw := range req.Tools {
+			var t map[string]any
+			if json.Unmarshal(raw, &t) == nil {
+				if typ, _ := t["type"].(string); typ == "tool_search" {
+					hasToolSearch = true
+					break
+				}
+			}
+		}
 		appendTool := func(tool map[string]any) {
 			name, _ := tool["name"].(string)
 			if name == "" {
@@ -611,6 +625,9 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 			typ, _ := t["type"].(string)
 			switch typ {
 			case "namespace":
+				if hasToolSearch {
+					continue
+				}
 				ns, _ := t["name"].(string)
 				children, _ := t["tools"].([]any)
 				for _, rawChild := range children {

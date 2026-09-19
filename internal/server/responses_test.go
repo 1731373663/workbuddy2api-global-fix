@@ -545,3 +545,70 @@ func TestEncodeToolNameRoundTrip(t *testing.T) {
 
 // TestResponsesReasoningMergedIntoAssistant DeepSeek 思考模式：reasoning item 的
 // 文本必须回填到带 tool_calls 的 assistant 消息，避免 11155 reasoning_content_missing。
+
+func TestResponsesToolSearchHidesNamespaceUntilDiscovered(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[{"type":"message","role":"user","content":"find cua"}],
+		"tools":[
+			{"type":"tool_search","execution":"client","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+			{"type":"namespace","name":"mcp__cua_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}]}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools, _ := chat["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("initial tools=%v want only tool_search", tools)
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "tool_search" {
+		t.Fatalf("initial tool=%v want tool_search", fn)
+	}
+}
+
+func TestResponsesToolSearchDiscoveredNamespaceStillCallable(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":"find cua"},
+			{"type":"tool_search_call","call_id":"call_search","execution":"client","arguments":{"query":"cua_repl js"}},
+			{"type":"tool_search_output","call_id":"call_search","execution":"client","status":"completed","tools":[{"type":"namespace","name":"mcp__cua_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}]}]}
+		],
+		"tools":[
+			{"type":"tool_search","execution":"client","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+			{"type":"namespace","name":"mcp__cua_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}]}
+		]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools, _ := chat["tools"].([]any)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		names = append(names, decodeToolName(name))
+	}
+	found := false
+	for _, name := range names {
+		if name == "mcp__cua_repl.js" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("discovered namespace tool missing after tool_search_output: %v", names)
+	}
+}
