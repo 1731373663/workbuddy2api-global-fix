@@ -113,6 +113,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/responses/{id}", h.withAuth(h.responsesGet))
 	h.mux.HandleFunc("DELETE /v1/responses/{id}", h.withAuth(h.responsesDelete))
 	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/v1/messages", h.withAuth(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/v1/messages/count_tokens", h.withAuth(h.anthropicCountTokens))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.anthropicCountTokens))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
@@ -161,17 +163,25 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey != "" {
 			authz := r.Header.Get("Authorization")
-			// Claude Code 使用 Anthropic 协议：认证头是 x-api-key，而不是
-			// Authorization: Bearer。仅对 /v1/messages* 放宽为同时接受两种头；
-			// OpenAI/Responses 路由保持原有 Bearer 语义不变。
+			// Claude Code 使用 Anthropic 协议：ANTHROPIC_API_KEY 发 x-api-key，
+			// ANTHROPIC_AUTH_TOKEN 发 Authorization: Bearer。仅 Anthropic 路由
+			// 同时接受两种头；OpenAI/Responses 路由保持原有 Bearer 语义不变。
 			provided := ""
 			ok := false
-			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
-				provided = strings.TrimSpace(r.Header.Get("x-api-key"))
-				ok = provided != ""
+			if isAnthropicMessagesPath(r.URL.Path) {
+				candidates := []string{strings.TrimSpace(r.Header.Get("x-api-key"))}
+				if token, hasBearer := bearerToken(authz); hasBearer {
+					candidates = append(candidates, token)
+				}
+				for _, candidate := range candidates {
+					if candidate != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(h.cfg.APIKey)) == 1 {
+						provided = candidate
+						ok = true
+						break
+					}
+				}
 			} else {
-				provided = strings.TrimPrefix(authz, "Bearer ")
-				ok = strings.HasPrefix(authz, "Bearer ")
+				provided, ok = bearerToken(authz)
 			}
 			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
 			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
@@ -184,6 +194,23 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func isAnthropicMessagesPath(path string) bool {
+	switch path {
+	case "/v1/messages", "/v1/messages/count_tokens", "/v1/v1/messages", "/v1/v1/messages/count_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+func bearerToken(authz string) (string, bool) {
+	const prefix = "Bearer "
+	authz = strings.TrimSpace(authz)
+	if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(authz[len(prefix):]), true
+}
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，

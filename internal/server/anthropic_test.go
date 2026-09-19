@@ -107,3 +107,32 @@ func TestAnthropicCountTokensEndpoint(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAnthropicAuthHeadersAndCompatiblePaths(t *testing.T) {
+	h := NewHandler(Config{APIKey: "secret"})
+	body := `{"model":"x","messages":[{"role":"user","content":"hello world"}]}`
+	cases := []struct {
+		name   string
+		path   string
+		header string
+		value  string
+		want   int
+	}{
+		{"x-api-key canonical", "/v1/messages/count_tokens", "x-api-key", "secret", 200},
+		{"bearer canonical", "/v1/messages/count_tokens", "Authorization", "Bearer secret", 200},
+		{"x-api-key duplicated v1", "/v1/v1/messages/count_tokens", "x-api-key", "secret", 200},
+		{"bearer duplicated v1", "/v1/v1/messages/count_tokens", "Authorization", "Bearer secret", 200},
+		{"wrong key", "/v1/messages/count_tokens", "Authorization", "Bearer wrong", 401},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", tc.path, strings.NewReader(body))
+			req.Header.Set(tc.header, tc.value)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("code=%d want=%d body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
