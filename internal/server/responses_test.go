@@ -612,3 +612,36 @@ func TestResponsesToolSearchDiscoveredNamespaceStillCallable(t *testing.T) {
 		t.Fatalf("discovered namespace tool missing after tool_search_output: %v", names)
 	}
 }
+
+func TestResponsesToolSearchBackfillsMissingCuaRepl(t *testing.T) {
+	body := []byte(`{
+		"model":"global:deepseek-v4.1-flash",
+		"input":[
+			{"type":"message","role":"user","content":"open WeChat with computer use"},
+			{"type":"tool_search_call","call_id":"call_search","execution":"client","arguments":{"query":"computer use desktop automation"}},
+			{"type":"tool_search_output","call_id":"call_search","execution":"client","status":"completed","tools":[{"type":"namespace","name":"mcp__node_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}]}]}
+		],
+		"tools":[{"type":"tool_search","execution":"client","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]
+	}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools, _ := chat["tools"].([]any)
+	found := false
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if decodeToolName(name) == "mcp__cua_repl.js" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing cua_repl fallback: %v", tools)
+	}
+}

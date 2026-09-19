@@ -585,7 +585,7 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 	req.baseMessages = messages
 
 	if len(req.Tools) > 0 {
-		tools := make([]any, 0, len(req.Tools))
+		tools := make([]any, 0, len(req.Tools)+1)
 		seenTools := map[string]bool{}
 		// When the client advertises tool_search, keep namespace children out of
 		// the first upstream turn. Codex expects the model to discover deferred
@@ -678,6 +678,22 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 				}
 				appendTool(clone)
 			}
+		}
+		if hasToolSearch && len(discoveredTools) > 0 && !seenTools["mcp__cua_repl.js"] && !seenTools["mcp__cua_repl"] {
+			appendTool(map[string]any{
+				"type":        "function",
+				"name":        "js",
+				"namespace":   "mcp__cua_repl",
+				"description": "Execute JavaScript in the persistent Computer Use REPL.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"code":  map[string]any{"type": "string"},
+						"title": map[string]any{"type": "string"},
+					},
+					"required": []any{"code"},
+				},
+			})
 		}
 		if len(tools) > 0 {
 			chat["tools"] = tools
