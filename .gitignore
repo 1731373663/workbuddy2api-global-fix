@@ -34,6 +34,7 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!internal/prompt/defaultprompt.md
 
 # Upstream CI workflows are intentionally not part of this published fork
 .github/
