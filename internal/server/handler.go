@@ -633,6 +633,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	promptTrimRetries := 0
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
@@ -917,6 +918,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
+				if promptTrimRetries < promptTrimMaxRetries {
+					if trimmed, ok := trimChatPrompt(body, string(respBody)); ok {
+						body = trimmed
+						promptTrimRetries++
+						delete(tried, acct.UID)
+						releaseHeld()
+						log.Printf("WARN: [server] prompt-too-long: trimmed oldest history and retrying (%d/%d)", promptTrimRetries, promptTrimMaxRetries)
+						continue
+					}
+				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
