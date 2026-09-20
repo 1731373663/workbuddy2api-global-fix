@@ -196,6 +196,47 @@ func TestReset(t *testing.T) {
 	}
 }
 
+// TestRequestDetailsKeepsNewestAndFiltersByModel 逐请求详情按最新在前、可按模型过滤。
+func TestRequestDetailsKeepsNewestAndFiltersByModel(t *testing.T) {
+	c := New("")
+	c.Record(Delta{Model: "a", OK: true, Status: 200, PromptTokens: 1, CompletionTokens: 2})
+	c.Record(Delta{Model: "b", OK: true, Status: 200, PromptTokens: 3, CompletionTokens: 4})
+	c.Record(Delta{Model: "a", OK: false, Status: 429, ErrorCode: "rate_limit_exceeded"})
+
+	a := c.RequestDetails("a", 10)
+	if len(a) != 2 {
+		t.Fatalf("model a details=%d want 2", len(a))
+	}
+	if a[0].Status != 429 || a[1].Status != 200 {
+		t.Errorf("details should be newest first: %+v", a)
+	}
+	if a[0].ErrorCode != "rate_limit_exceeded" {
+		t.Errorf("error code not preserved: %+v", a[0])
+	}
+	if all := c.RequestDetails("", 10); len(all) != 3 {
+		t.Errorf("all details=%d want 3", len(all))
+	}
+}
+
+// TestRequestDetailsRingCapacity 环绕容量固定，重置后清空。
+func TestRequestDetailsRingCapacity(t *testing.T) {
+	c := New("")
+	for i := 0; i < requestDetailCapacity+25; i++ {
+		c.Record(Delta{Model: "m", OK: true, Status: 200, PromptTokens: int64(i)})
+	}
+	got := c.RequestDetails("m", 0)
+	if len(got) != requestDetailCapacity {
+		t.Fatalf("ring size=%d want %d", len(got), requestDetailCapacity)
+	}
+	if got[0].PromptTokens != requestDetailCapacity+24 {
+		t.Errorf("newest prompt=%d want %d", got[0].PromptTokens, requestDetailCapacity+24)
+	}
+	c.Reset()
+	if again := c.RequestDetails("", 0); len(again) != 0 {
+		t.Errorf("reset should clear details, got %d", len(again))
+	}
+}
+
 // TestConcurrentRecord 并发记录不应丢数据或触发竞态（-race 下有完整意义）。
 func TestConcurrentRecord(t *testing.T) {
 	c := New("")

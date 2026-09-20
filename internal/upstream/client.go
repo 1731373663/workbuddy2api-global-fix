@@ -966,7 +966,15 @@ func chatFallbackStatus(status int, body string) bool {
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
+	rc, status, respBody, _, err = c.ChatStreamContextDetail(context.Background(), a, body, clientIP, meta)
+	return rc, status, respBody, err
+}
+
+// ChatStreamResult 在保留原有返回值的基础上，额外给出实际命中的上游路径与尝试次数。
+// 旧调用方仍可使用 ChatStreamContext 的兼容四返回值；统计详情需要路径时用本函数。
+type ChatStreamResult struct {
+	Path     string
+	Attempts int
 }
 
 // ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
@@ -980,6 +988,13 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 返回（错误透传语义 5755fe3：message 透传上游原文）。判定为 ErrNone 的响应
 // （理论上不存在，防御）err 为 nil，handler 按 respBody 自行兜底。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	rc, status, respBody, _, err = c.ChatStreamContextDetail(ctx, a, body, clientIP, meta)
+	return rc, status, respBody, err
+}
+
+// ChatStreamContextDetail 与 ChatStreamContext 行为一致，额外返回实际命中的
+// 上游路径和尝试次数，供请求统计详情使用；不改变原有转发语义。
+func (c *Client) ChatStreamContextDetail(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, info ChatStreamResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -993,10 +1008,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for attempt, path := range c.chatPaths(a) {
+		info.Path = path
+		info.Attempts = attempt + 1
 		url := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, 0, nil, info, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
@@ -1011,7 +1028,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// 失败连接可能仍留在空闲池里，下一个请求会继续捡到它（kongjianguan
 			// 实测：仅靠 IdleConnTimeout 等过期不够，主动清池才断根）。
 			roundTripCloseIdle(c.chatHTTP().Transport)
-			return nil, 0, nil, err
+			return nil, 0, nil, info, err
 		}
 		if resp.StatusCode >= 400 {
 			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -1021,7 +1038,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 			if rerr != nil {
 				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
-				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+				return nil, 0, nil, info, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
@@ -1034,18 +1051,18 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
-				return nil, resp.StatusCode, raw, nil
+				return nil, resp.StatusCode, raw, info, nil
 			}
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
 			}
-			return nil, resp.StatusCode, raw, ue
+			return nil, resp.StatusCode, raw, info, ue
 		}
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, info, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }

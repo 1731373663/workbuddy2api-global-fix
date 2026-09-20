@@ -76,17 +76,78 @@ type Snapshot struct {
 	Now time.Time `json:"now"`
 }
 
-// delta 单个请求的观测值，由 handler 填充。
+// requestDetailCapacity 是面板逐请求日志的内存上限。
+const requestDetailCapacity = 500
+
+// RequestDetail 单次请求的完整观测快照（内存保留，重启后清空）。
+type RequestDetail struct {
+	Seq       int64     `json:"seq"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
+
+	Model      string `json:"model"`
+	Realm      string `json:"realm,omitempty"`
+	AccountUID string `json:"account_uid,omitempty"`
+	RequestID  string `json:"request_id,omitempty"`
+	TraceID    string `json:"trace_id,omitempty"`
+
+	Stream bool `json:"stream"`
+	OK     bool `json:"ok"`
+	Status int  `json:"status"`
+
+	TTFBMS    int64 `json:"ttfb_ms"`
+	LatencyMS int64 `json:"latency_ms"`
+	GenMS     int64 `json:"gen_ms"`
+
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	CacheHitTokens   int64 `json:"cache_hit_tokens"`
+	CacheMissTokens  int64 `json:"cache_miss_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	UsageReported    bool  `json:"usage_reported"`
+
+	Credit float64 `json:"credit"`
+
+	FinishReason string `json:"finish_reason,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+
+	ReasoningEffort  string  `json:"reasoning_effort,omitempty"`
+	ReasoningSummary string  `json:"reasoning_summary,omitempty"`
+	Temperature      float64 `json:"temperature,omitempty"`
+	TopP             float64 `json:"top_p,omitempty"`
+	MaxOutputTokens  int64   `json:"max_output_tokens,omitempty"`
+
+	Endpoint string `json:"endpoint,omitempty"`
+	Fallback bool   `json:"fallback"`
+	Attempts int    `json:"attempts"`
+
+	ToolCalls   int `json:"tool_calls"`
+	ImageInputs int `json:"image_inputs"`
+}
+
+// Delta 单个请求的观测值，由 handler 填充。
 type Delta struct {
-	Model    string
-	Stream   bool
-	OK       bool
-	TTFB     time.Duration // 流式首字延迟；同步请求为 0
-	Latency  time.Duration // 端到端
-	HasUsage bool
+	Model     string
+	Stream    bool
+	OK        bool
+	Status    int
+	StartedAt time.Time
+	EndedAt   time.Time
+	TTFB      time.Duration // 流式首字延迟；同步请求为 0
+	Latency   time.Duration // 端到端
+	HasUsage  bool
+
+	Realm      string
+	AccountUID string
+	RequestID  string
+	TraceID    string
 
 	PromptTokens     int64
 	CompletionTokens int64
+	ReasoningTokens  int64
 	TotalTokens      int64
 
 	CacheHitTokens      int64
@@ -96,13 +157,34 @@ type Delta struct {
 	CacheCreationTokens int64
 
 	Credit float64
+
+	FinishReason string
+	ErrorCode    string
+	ErrorMessage string
+
+	ReasoningEffort  string
+	ReasoningSummary string
+	Temperature      float64
+	TopP             float64
+	MaxOutputTokens  int64
+
+	Endpoint string
+	Fallback bool
+	Attempts int
+
+	ToolCalls   int
+	ImageInputs int
 }
 
 // Collector 线程安全的统计收集器。
 type Collector struct {
-	mu     sync.Mutex
-	models map[string]*ModelStats
-	since  time.Time
+	mu      sync.Mutex
+	models  map[string]*ModelStats
+	since   time.Time
+	details []RequestDetail
+	next    int
+	count   int
+	seq     int64
 
 	// stateFile 非空时落盘（重启后累计值不丢）。
 	stateFile string
@@ -118,6 +200,7 @@ func New(stateFile string) *Collector {
 	c := &Collector{
 		models:     map[string]*ModelStats{},
 		since:      time.Now(),
+		details:    make([]RequestDetail, requestDetailCapacity),
 		stateFile:  stateFile,
 		flushEvery: 20,
 	}
@@ -134,6 +217,15 @@ func (c *Collector) Record(d Delta) {
 		model = "(unknown)"
 	}
 	now := time.Now()
+	if d.EndedAt.IsZero() {
+		d.EndedAt = now
+	}
+	if d.StartedAt.IsZero() {
+		d.StartedAt = d.EndedAt.Add(-d.Latency)
+	}
+	if d.Status == 0 && d.OK {
+		d.Status = 200
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -186,6 +278,55 @@ func (c *Collector) Record(d Delta) {
 		m.CreditMilli += int64(d.Credit*1000 + 0.5)
 	}
 
+	// 逐请求明细：仅保留最近 requestDetailCapacity 条，不进持久化文件。
+	c.seq++
+	genMS := int64(0)
+	if d.Latency > 0 && d.TTFB > 0 && d.Latency > d.TTFB {
+		genMS = (d.Latency - d.TTFB).Milliseconds()
+	}
+	c.details[c.next] = RequestDetail{
+		Seq:              c.seq,
+		StartedAt:        d.StartedAt,
+		EndedAt:          d.EndedAt,
+		Model:            model,
+		Realm:            d.Realm,
+		AccountUID:       d.AccountUID,
+		RequestID:        d.RequestID,
+		TraceID:          d.TraceID,
+		Stream:           d.Stream,
+		OK:               d.OK,
+		Status:           d.Status,
+		TTFBMS:           d.TTFB.Milliseconds(),
+		LatencyMS:        d.Latency.Milliseconds(),
+		GenMS:            genMS,
+		PromptTokens:     d.PromptTokens,
+		CompletionTokens: d.CompletionTokens,
+		ReasoningTokens:  d.ReasoningTokens,
+		TotalTokens:      d.TotalTokens,
+		CacheHitTokens:   d.CacheHitTokens + d.CacheReadTokens,
+		CacheMissTokens:  d.CacheMissTokens,
+		CacheWriteTokens: d.CacheWriteTokens + d.CacheCreationTokens,
+		UsageReported:    d.HasUsage,
+		Credit:           d.Credit,
+		FinishReason:     d.FinishReason,
+		ErrorCode:        d.ErrorCode,
+		ErrorMessage:     d.ErrorMessage,
+		ReasoningEffort:  d.ReasoningEffort,
+		ReasoningSummary: d.ReasoningSummary,
+		Temperature:      d.Temperature,
+		TopP:             d.TopP,
+		MaxOutputTokens:  d.MaxOutputTokens,
+		Endpoint:         d.Endpoint,
+		Fallback:         d.Fallback,
+		Attempts:         d.Attempts,
+		ToolCalls:        d.ToolCalls,
+		ImageInputs:      d.ImageInputs,
+	}
+	c.next = (c.next + 1) % len(c.details)
+	if c.count < len(c.details) {
+		c.count++
+	}
+
 	c.dirty = true
 	c.sinceFlush++
 	if c.stateFile != "" && c.sinceFlush >= c.flushEvery {
@@ -213,11 +354,39 @@ func (c *Collector) Snapshot() Snapshot {
 	return out
 }
 
+// RequestDetails 返回指定模型的最近请求（最新在前）。
+// model 为空时返回全部模型；limit<=0 或超过当前条数时返回当前全部。
+func (c *Collector) RequestDetails(model string, limit int) []RequestDetail {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.count == 0 {
+		return []RequestDetail{}
+	}
+	if limit <= 0 || limit > c.count {
+		limit = c.count
+	}
+	out := make([]RequestDetail, 0, limit)
+	for i := 0; i < c.count && len(out) < limit; i++ {
+		idx := (c.next - 1 - i + len(c.details)) % len(c.details)
+		d := c.details[idx]
+		if model != "" && d.Model != model {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
 // Reset 清空统计（面板"重置统计"用）。
 func (c *Collector) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.models = map[string]*ModelStats{}
+	clear(c.details)
+	c.next = 0
+	c.count = 0
+	c.seq = 0
 	c.since = time.Now()
 	c.dirty = true
 	c.saveLocked()

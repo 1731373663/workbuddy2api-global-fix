@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +120,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
+	h.mux.HandleFunc("GET /v1/stats/details", h.withAuth(h.statsDetails))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -146,6 +148,32 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		"uptime_sec": snap.UptimeSec,
 		"total":      snap.Total,
 		"models":     snap.Models,
+	})
+}
+
+// statsDetails 返回最近请求详情，可按模型过滤。该数据只保存在内存中，
+// 最多最近 500 条，网关重启后清空；累计统计仍由 /v1/stats 持久化。
+func (h *Handler) statsDetails(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "details": []any{}})
+		return
+	}
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	details := h.cfg.Metrics.RequestDetails(model, limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"model":   model,
+		"count":   len(details),
+		"details": details,
 	})
 }
 
@@ -553,8 +581,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
+		Stream              bool    `json:"stream"`
+		Model               string  `json:"model"`
+		ReasoningEffort     string  `json:"reasoning_effort"`
+		ReasoningEffortAlt  string  `json:"reasoningEffort"`
+		ReasoningSummary    string  `json:"reasoning_summary"`
+		ReasoningSummaryAlt string  `json:"reasoningSummary"`
+		Temperature         float64 `json:"temperature"`
+		TopP                float64 `json:"top_p"`
+		MaxTokens           int64   `json:"max_tokens"`
+		MaxCompletion       int64   `json:"max_completion_tokens"`
+		Messages            []any   `json:"messages"`
+		Tools               []any   `json:"tools"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
@@ -565,6 +603,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.realm = realm
+	st.requestID = chatRequestID(r, body, peek.Model)
+	if v := r.Header.Get("X-Trace-ID"); v != "" {
+		st.traceID = v
+	}
+	if peek.ReasoningEffort != "" {
+		st.detail.ReasoningEffort = peek.ReasoningEffort
+	} else if peek.ReasoningEffortAlt != "" {
+		st.detail.ReasoningEffort = peek.ReasoningEffortAlt
+	} else {
+		st.detail.ReasoningEffort = r.Header.Get("X-Reasoning-Effort")
+	}
+	if peek.ReasoningSummary != "" {
+		st.detail.ReasoningSummary = peek.ReasoningSummary
+	} else {
+		st.detail.ReasoningSummary = peek.ReasoningSummaryAlt
+	}
+	st.detail.Temperature = peek.Temperature
+	st.detail.TopP = peek.TopP
+	st.detail.MaxOutputTokens = peek.MaxTokens
+	if st.detail.MaxOutputTokens == 0 {
+		st.detail.MaxOutputTokens = peek.MaxCompletion
+	}
+	st.detail.ToolCalls = countToolCalls(peek.Messages)
+	st.detail.ImageInputs = countImageInputs(peek.Messages)
 	st.collector = h.cfg.Metrics
 	defer st.done()
 
@@ -767,7 +830,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		rc, status, respBody, streamInfo, terr := h.cfg.Upstream.ChatStreamContextDetail(r.Context(), acct, body, clientIP, chatMeta)
+		st.detail.Endpoint = streamInfo.Path
+		if streamInfo.Attempts > 1 {
+			st.detail.Fallback = true
+		}
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
 		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
@@ -834,6 +901,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
 				st.status = http.StatusBadRequest
+				st.detail.ErrorCode = "content_blocked"
+				st.detail.ErrorMessage = msg
 				return
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
@@ -848,6 +917,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
 				st.status = http.StatusBadRequest
+				st.detail.ErrorCode = "prompt_too_long"
+				st.detail.ErrorMessage = promptTooLongMessage(string(respBody))
 				return
 			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
@@ -886,6 +957,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.usage = stats.Usage()
+			st.detail.FinishReason = stats.FinishReason()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
@@ -911,6 +983,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		if u, ok := resp["usage"].(map[string]any); ok {
 			st.usage = ParseUsage(u)
+		}
+		if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
+			if ch, ok := choices[0].(map[string]any); ok {
+				st.detail.FinishReason, _ = ch["finish_reason"].(string)
+			}
 		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
@@ -957,6 +1034,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, status, code, msg)
 	st.status = status
+	st.detail.ErrorCode = code
+	st.detail.ErrorMessage = msg
 }
 
 // promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/

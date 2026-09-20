@@ -3,9 +3,12 @@ package server
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -23,16 +26,21 @@ var chatLogEnabled = true
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	start     time.Time
+	model     string
+	realm     string
+	mode      string // "stream" | "sync"
+	uid       string // 完整 uid，展示时只取前 8 位
+	ttfb      time.Duration
+	toks      int // <0 表示 usage 缺失 → 显示 "-"
+	status    int
+	requestID string
+	traceID   string
 
 	// usage 完整 usage 明细（流式末帧 / 非流式聚合响应），供统计模块提取缓存与扣费。
 	usage *UsageDetail
+	// detail 逐请求日志的附加观测；由 handler 在实际转发路径填写。
+	detail metrics.RequestDetail
 	// collector 非 nil 时在 done() 里把本次请求记入统计。
 	collector *metrics.Collector
 
@@ -64,16 +72,37 @@ func (s *chatStat) record() {
 		return
 	}
 	d := metrics.Delta{
-		Model:    s.model,
-		Stream:   s.mode == "stream",
-		OK:       s.status >= 200 && s.status < 300,
-		TTFB:     s.ttfb,
-		Latency:  time.Since(s.start),
-		HasUsage: s.usage != nil,
+		Model:            s.model,
+		Stream:           s.mode == "stream",
+		OK:               s.status >= 200 && s.status < 300,
+		Status:           s.status,
+		StartedAt:        s.start,
+		EndedAt:          time.Now(),
+		TTFB:             s.ttfb,
+		Latency:          time.Since(s.start),
+		HasUsage:         s.usage != nil,
+		Realm:            s.realm,
+		AccountUID:       s.uid,
+		RequestID:        s.requestID,
+		TraceID:          s.traceID,
+		FinishReason:     s.detail.FinishReason,
+		ErrorCode:        s.detail.ErrorCode,
+		ErrorMessage:     s.detail.ErrorMessage,
+		ReasoningEffort:  s.detail.ReasoningEffort,
+		ReasoningSummary: s.detail.ReasoningSummary,
+		Temperature:      s.detail.Temperature,
+		TopP:             s.detail.TopP,
+		MaxOutputTokens:  s.detail.MaxOutputTokens,
+		Endpoint:         s.detail.Endpoint,
+		Fallback:         s.detail.Fallback,
+		Attempts:         s.detail.Attempts,
+		ToolCalls:        s.detail.ToolCalls,
+		ImageInputs:      s.detail.ImageInputs,
 	}
 	if u := s.usage; u != nil {
 		d.PromptTokens = u.PromptTokens
 		d.CompletionTokens = u.CompletionTokens
+		d.ReasoningTokens = u.ReasoningTokens
 		d.TotalTokens = u.TotalTokens
 		d.CacheHitTokens = u.CacheHitTokens
 		d.CacheMissTokens = u.CacheMissTokens
@@ -96,10 +125,11 @@ type chatStatsReader struct {
 	hasUsage  bool // 末帧是否带 usage
 	hasCredit bool // 是否出现过带 credit 的 usage（缺失≠0，见 Credit() 注释）
 	tokens    int
-	credit    float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
-	prompt    int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
+	credit    float64      // 末帧 usage.credit（本次真实扣费，供成本账本）
+	prompt    int          // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
+	finish    string       // 末帧 choices[].finish_reason
 	usage     *UsageDetail // 末帧完整 usage 明细（供统计模块）
-	pend      []byte  // 已读未返回的行缓存
+	pend      []byte       // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -115,6 +145,9 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
 // Usage 返回末帧完整 usage 明细（无 usage 时为 nil）。
 func (s *chatStatsReader) Usage() *UsageDetail { return s.usage }
+
+// FinishReason 返回末帧 finish_reason（缺失为空）。
+func (s *chatStatsReader) FinishReason() string { return s.finish }
 
 // Credit 返回末帧 usage.credit（本次真实扣费）。ok=true 要求 usage 存在**且** credit
 // 字段显式出现——字段缺失时 ok=false（缺失≠0：不能把"缺观测"当"0 成本"写入账本，
@@ -139,9 +172,20 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.ttfb = time.Since(s.start)
 	}
 	var chunk struct {
-		Usage map[string]any `json:"usage"`
+		Usage   map[string]any `json:"usage"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
+		return
+	}
+	for _, choice := range chunk.Choices {
+		if choice.FinishReason != "" && choice.FinishReason != "null" {
+			s.finish = choice.FinishReason
+		}
+	}
+	if chunk.Usage == nil {
 		return
 	}
 	s.hasUsage = true
@@ -219,6 +263,10 @@ type UsageDetail struct {
 
 	// Credit 上游返回的实际扣费（部分模型带 credit 字段）。
 	Credit float64
+
+	// ReasoningTokens 推理输出 token（优先 completion_tokens_details.reasoning_tokens，
+	// 缺失时读顶层 reasoning_tokens；缺失按 0）。
+	ReasoningTokens int64
 }
 
 // ParseUsage 把上游 usage 对象归一化为 UsageDetail。字段缺失一律按 0 处理。
@@ -226,11 +274,12 @@ func ParseUsage(u map[string]any) *UsageDetail {
 	d := &UsageDetail{
 		PromptTokens:     int64Field(u, "prompt_tokens"),
 		CompletionTokens: int64Field(u, "completion_tokens"),
+		ReasoningTokens:  reasoningTokensFromUsage(u),
 		TotalTokens:      int64Field(u, "total_tokens"),
 
-		CacheHitTokens:   int64Field(u, "prompt_cache_hit_tokens"),
-		CacheMissTokens:  int64Field(u, "prompt_cache_miss_tokens"),
-		CacheWriteTokens: int64Field(u, "prompt_cache_write_tokens"),
+		CacheHitTokens:      int64Field(u, "prompt_cache_hit_tokens"),
+		CacheMissTokens:     int64Field(u, "prompt_cache_miss_tokens"),
+		CacheWriteTokens:    int64Field(u, "prompt_cache_write_tokens"),
 		CacheReadTokens:     int64Field(u, "cache_read_input_tokens"),
 		CacheCreationTokens: int64Field(u, "cache_creation_input_tokens"),
 
@@ -243,6 +292,21 @@ func ParseUsage(u map[string]any) *UsageDetail {
 		d.TotalTokens = d.PromptTokens + d.CompletionTokens
 	}
 	return d
+}
+
+// reasoningTokensFromUsage 读取推理 token 明细，兼容 OpenAI/Anthropic 两种常见形态。
+func reasoningTokensFromUsage(u map[string]any) int64 {
+	if details, ok := u["completion_tokens_details"].(map[string]any); ok {
+		if v := int64Field(details, "reasoning_tokens"); v > 0 {
+			return v
+		}
+	}
+	if details, ok := u["output_tokens_details"].(map[string]any); ok {
+		if v := int64Field(details, "reasoning_tokens"); v > 0 {
+			return v
+		}
+	}
+	return int64Field(u, "reasoning_tokens")
 }
 
 // int64Field 从 map 取整数字段（兼容 JSON number 与字符串数字形态）。
@@ -285,6 +349,59 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 		return 0, 0, false
 	}
 	return c, int(pt) + int(ct), true
+}
+
+// chatRequestID 为详情页生成稳定请求标识：优先入站请求头，否则由 body 派生短标识。
+func chatRequestID(r *http.Request, body []byte, model string) string {
+	for _, key := range []string{"X-Request-ID", "X-Conversation-Request-ID", "X-Trace-ID"} {
+		if v := strings.TrimSpace(r.Header.Get(key)); v != "" {
+			return v
+		}
+	}
+	sum := sha256.Sum256(append(append([]byte(model), 0), body...))
+	return hex.EncodeToString(sum[:8])
+}
+
+// countToolCalls 统计入站消息中的 assistant tool_calls 数量。
+func countToolCalls(messages []any) int {
+	n := 0
+	for _, raw := range messages {
+		m, _ := raw.(map[string]any)
+		if m == nil {
+			continue
+		}
+		if calls, ok := m["tool_calls"].([]any); ok {
+			n += len(calls)
+		}
+	}
+	return n
+}
+
+// countImageInputs 统计入站消息中的图片块数量（兼容 Chat Completions 的
+// content[].image_url 与 Responses 翻译前的 input_image 形态）。
+func countImageInputs(messages []any) int {
+	n := 0
+	for _, raw := range messages {
+		m, _ := raw.(map[string]any)
+		if m == nil {
+			continue
+		}
+		parts, ok := m["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, partRaw := range parts {
+			part, _ := partRaw.(map[string]any)
+			if part == nil {
+				continue
+			}
+			typ, _ := part["type"].(string)
+			if typ == "image_url" || typ == "input_image" || typ == "image" {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
