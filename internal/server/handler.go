@@ -835,6 +835,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if streamInfo.Attempts > 1 {
 			st.detail.Fallback = true
 		}
+		st.detail.Attempts = streamInfo.Attempts
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
 		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
