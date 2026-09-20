@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
 WORKDIR /src
+# Build-time only: never inherit a host proxy address such as 127.0.0.1:7897.
+# Docker uses its own network/proxy; these variables affect only this build stage.
+ENV HTTP_PROXY=
+ENV HTTPS_PROXY=
+ENV http_proxy=
+ENV https_proxy=
 COPY go.mod ./
 RUN go mod download
 COPY . .
