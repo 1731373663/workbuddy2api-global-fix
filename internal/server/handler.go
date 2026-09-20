@@ -832,6 +832,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
 		rc, status, respBody, streamInfo, terr := h.cfg.Upstream.ChatStreamContextDetail(r.Context(), acct, body, clientIP, chatMeta)
 		st.detail.Endpoint = streamInfo.Path
+		if streamInfo.ReasoningEffort != "" {
+			st.detail.ReasoningEffort = streamInfo.ReasoningEffort
+		}
 		if streamInfo.Attempts > 1 {
 			st.detail.Fallback = true
 		}

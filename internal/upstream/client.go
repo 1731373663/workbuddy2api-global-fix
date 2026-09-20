@@ -216,7 +216,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 //
 // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
 // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
 // 上游原文可自行排查，代价可控。
 var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
 	`"code":11115`,
@@ -973,8 +973,9 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // ChatStreamResult 在保留原有返回值的基础上，额外给出实际命中的上游路径与尝试次数。
 // 旧调用方仍可使用 ChatStreamContext 的兼容四返回值；统计详情需要路径时用本函数。
 type ChatStreamResult struct {
-	Path     string
-	Attempts int
+	Path            string
+	Attempts        int
+	ReasoningEffort string
 }
 
 // ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
@@ -1001,6 +1002,7 @@ func (c *Client) ChatStreamContextDetail(ctx context.Context, a *auth.Auth, body
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	info.ReasoningEffort = reasoningEffortFromBody(prepared)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
@@ -1074,6 +1076,23 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
 		return []string{globalChatConsolePath, chatCompletionsPath}
 	}
 	return []string{chatCompletionsPath}
+}
+
+// reasoningEffortFromBody 读取改写后的出站请求体，返回最终生效的推理档位。
+// 入站请求可能没有显式档位，但 prepareBody 会为思考模型补默认档，因此详情
+// 应记录这里的结果，而不是只看客户端原值。
+func reasoningEffortFromBody(body []byte) string {
+	var obj struct {
+		ReasoningEffort    string `json:"reasoning_effort"`
+		ReasoningEffortAlt string `json:"reasoningEffort"`
+	}
+	if json.Unmarshal(body, &obj) != nil {
+		return ""
+	}
+	if obj.ReasoningEffort != "" {
+		return obj.ReasoningEffort
+	}
+	return obj.ReasoningEffortAlt
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。

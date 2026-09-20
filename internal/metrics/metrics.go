@@ -76,10 +76,11 @@ type Snapshot struct {
 	Now time.Time `json:"now"`
 }
 
-// requestDetailCapacity 是面板逐请求日志的内存上限。
-const requestDetailCapacity = 500
+// requestDetailCapacity 是面板逐请求日志的保留上限。
+// 当前策略：只保留最近 100 条，并随累计统计一起落盘，网关重启后恢复。
+const requestDetailCapacity = 100
 
-// RequestDetail 单次请求的完整观测快照（内存保留，重启后清空）。
+// RequestDetail 单次请求的完整观测快照（随 metrics.json 持久化）。
 type RequestDetail struct {
 	Seq       int64     `json:"seq"`
 	StartedAt time.Time `json:"started_at"`
@@ -329,7 +330,8 @@ func (c *Collector) Record(d Delta) {
 
 	c.dirty = true
 	c.sinceFlush++
-	if c.stateFile != "" && c.sinceFlush >= c.flushEvery {
+	// 明细是最近请求排障的主要数据，每 5 条落盘一次，兼顾重启保留与写入频率。
+	if c.stateFile != "" && (c.sinceFlush >= c.flushEvery || c.count > 0 && c.sinceFlush >= 5) {
 		c.saveLocked()
 	}
 }
@@ -438,6 +440,10 @@ func addInto(dst, src *ModelStats) {
 type stateFile struct {
 	Since  time.Time              `json:"since"`
 	Models map[string]*ModelStats `json:"models"`
+	// Details 最近请求明细（按写入顺序保存，重启后恢复）。
+	Details []RequestDetail `json:"details,omitempty"`
+	// Seq 已记录请求序号，恢复后继续单调递增。
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // saveLocked 原子落盘。调用方必须已持锁。
@@ -448,7 +454,13 @@ func (c *Collector) saveLocked() {
 	if c.stateFile == "" {
 		return
 	}
-	raw, err := json.MarshalIndent(stateFile{Since: c.since, Models: c.models}, "", "  ")
+	details := c.detailsListLocked()
+	raw, err := json.MarshalIndent(stateFile{
+		Since:   c.since,
+		Models:  c.models,
+		Details: details,
+		Seq:     c.seq,
+	}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -475,9 +487,41 @@ func (c *Collector) load() {
 	if sf.Models != nil {
 		c.models = sf.Models
 	}
+	if len(sf.Details) > 0 {
+		// 文件按旧→新保存；内存环形缓冲按写入顺序恢复，并把 next 指向最旧位置。
+		n := len(sf.Details)
+		if n > len(c.details) {
+			n = len(c.details)
+		}
+		start := len(sf.Details) - n
+		for i := 0; i < n; i++ {
+			c.details[i] = sf.Details[start+i]
+		}
+		c.count = n
+		c.next = n % len(c.details)
+	}
+	if sf.Seq > 0 {
+		c.seq = sf.Seq
+	}
 	if !sf.Since.IsZero() {
 		c.since = sf.Since
 	}
+}
+
+// detailsListLocked 返回按“最旧→最新”排列的明细快照，调用方必须持锁。
+func (c *Collector) detailsListLocked() []RequestDetail {
+	if c.count == 0 {
+		return nil
+	}
+	out := make([]RequestDetail, 0, c.count)
+	start := 0
+	if c.count == len(c.details) {
+		start = c.next
+	}
+	for i := 0; i < c.count; i++ {
+		out = append(out, c.details[(start+i)%len(c.details)])
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

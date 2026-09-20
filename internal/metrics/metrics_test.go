@@ -237,6 +237,33 @@ func TestRequestDetailsRingCapacity(t *testing.T) {
 	}
 }
 
+// TestRequestDetailsPersistAcrossReload 明细随 metrics.json 持久化，重启后仍保留。
+func TestRequestDetailsPersistAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "metrics.json")
+
+	c := New(fp)
+	for i := 0; i < 3; i++ {
+		c.Record(Delta{
+			Model: "m", OK: true, Status: 200,
+			PromptTokens: int64(i + 1), ReasoningEffort: "high",
+		})
+	}
+	c.Flush()
+
+	c2 := New(fp)
+	got := c2.RequestDetails("m", 10)
+	if len(got) != 3 {
+		t.Fatalf("persisted details=%d want 3", len(got))
+	}
+	if got[0].PromptTokens != 3 || got[2].PromptTokens != 1 {
+		t.Errorf("detail order mismatch: %+v", got)
+	}
+	if got[0].ReasoningEffort != "high" {
+		t.Errorf("reasoning effort not persisted: %+v", got[0])
+	}
+}
+
 // TestConcurrentRecord 并发记录不应丢数据或触发竞态（-race 下有完整意义）。
 func TestConcurrentRecord(t *testing.T) {
 	c := New("")
