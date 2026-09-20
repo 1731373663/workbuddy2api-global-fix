@@ -946,8 +946,15 @@ const (
 	globalChatConsolePath = "/console/chat/completions"
 )
 
-// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+// chatFallbackStatus global chat fallback：旧路径不存在时换新路径，或旧路径明确报
+// 模型级 6004 限流时尝试新路径。后者对齐官方客户端的 /v2 入口，仅在 body
+// 明确为 6004 时触发；普通 429/账号级限流不重复请求。
+func chatFallbackStatus(status int, body string) bool {
+	if status == 404 || status == 405 {
+		return true
+	}
+	return status == http.StatusTooManyRequests && IsModelRateLimit(body)
+}
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
@@ -1019,8 +1026,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
+			// global 首次路径 404/405 或明确 6004 → 换 fallback 路径重试；
+			// 普通 429/账号级限流直接返回，避免把重复请求扩散到整个账号。
+			if attempt < len(c.chatPaths(a))-1 && chatFallbackStatus(resp.StatusCode, string(raw)) {
 				continue
 			}
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：

@@ -121,6 +121,67 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 	}
 }
 
+// TestGlobalChatFallsBackToV2On6004 断言 /console 返回明确 6004 模型限流时，
+// 同一请求会尝试官方客户端使用的 /v2 路径，而不是直接把 429 返回给客户端。
+func TestGlobalChatFallsBackToV2On6004(t *testing.T) {
+	var calls []string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		if r.URL.Path == "/console/chat/completions" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":6004,"msg":"usage exceeds frequency limit"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("6004 chat fallback: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
+		t.Errorf("6004 chat fallback calls=%v want [console, v2]", calls)
+	}
+}
+
+// TestGlobalChatDoesNotFallbackOnPlain429 断言普通账号级 429 不触发路径回退，
+// 避免对非模型级限流重复请求并扩大上游压力。
+func TestGlobalChatDoesNotFallbackOnPlain429(t *testing.T) {
+	var calls []string
+	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":1,"msg":"429 rate limit"}`))
+	}))
+	defer chatSrv.Close()
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer billSrv.Close()
+
+	c := globalTestClient(t, chatSrv, billSrv)
+	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	if status != http.StatusTooManyRequests || err == nil {
+		t.Fatalf("plain 429: status=%d err=%v want 429 + error", status, err)
+	}
+	if len(calls) != 1 || calls[0] != "/console/chat/completions" {
+		t.Errorf("plain 429 calls=%v want only [console]", calls)
+	}
+}
+
 // TestGlobalBillingUsesBillingMeterThenV2Fallback 断言 global billing 先打 /billing/meter/*
 // 404 时 fallback /v2/billing/meter/*；CN billing 直接 /v2/billing/meter/*（现状逐字）。
 func TestGlobalBillingUsesBillingMeterThenV2Fallback(t *testing.T) {

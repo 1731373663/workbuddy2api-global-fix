@@ -869,9 +869,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+		// 同模型成功清命：清除 modelCooldowns[model]（覆盖 11102 与 6004），并在
+		// 该模型经真实请求成功后撤销旧路径产生的账号级软限流显示；硬冷却/熔断不动。
+		h.cfg.Pool.NoteModelSuccess(acct.UID, bareModel)
+		h.cfg.Pool.ClearSameModelSoftRate(acct.UID)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {

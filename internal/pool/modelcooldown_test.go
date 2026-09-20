@@ -482,6 +482,42 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	}
 }
 
+// TestNoteModelSuccessClearsOnlyTargetModel 同模型成功只清该模型条目，
+// 保留其他模型的 6004/11102 冷却，避免误放行。
+func TestNoteModelSuccessClearsOnlyTargetModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+	p.NoteModelSuccess("u1", "glm-5.3")
+	if _, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]; ok {
+		t.Fatal("glm-5.3 should be cleared after same-model success")
+	}
+	if _, ok := p.byUID["u1"].modelCooldowns["deepseek-v3-2-volc"]; !ok {
+		t.Fatal("unrelated model cooldown must remain")
+	}
+}
+
+// TestClearSameModelSoftRateOnlyClearsSoftRate 同模型回退成功只撤账号级
+// 429 软限流，不动硬冷却与熔断等其他维度。
+func TestClearSameModelSoftRateOnlyClearsSoftRate(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRate("u1", time.Minute, time.Now().Add(time.Hour), "429 rate limit")
+	p.ClearSameModelSoftRate("u1")
+	st, _ := p.Status("u1")
+	if st.Cooling || !st.Until.IsZero() {
+		t.Fatalf("soft-rate cooldown should be cleared: %+v", st)
+	}
+
+	p.Cooldown("u1", CoolHard, time.Hour, "余额不足")
+	p.ClearSameModelSoftRate("u1")
+	st, _ = p.Status("u1")
+	if !st.Cooling {
+		t.Fatalf("hard cooldown must remain: %+v", st)
+	}
+}
+
 // TestModelCooldownsPersistRoundTrip modelCooldowns 现已持久化：落盘 → 重启 → 恢复。
 // 修复了 PR #96 后的回归窗口：6004 模型级冷却可长达数小时，跨重启是常态，
 // 不持久化等于每次重启都要重新踩一遍所有 6004 雷区（选号 healthyForModel 失忆）。

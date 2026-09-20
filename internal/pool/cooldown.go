@@ -174,6 +174,53 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
+
+// ClearSameModelSoftRate 在同一模型经真实请求成功后，清除由该模型 6004 途径
+// 产生的账号级软限流冷却（coolKind=CoolSoft 且 reason 前缀为 429 rate limit）。
+// 只处理软限流；硬冷却、WAF、熔断与其他模型条目均保留。用于 /console 收到 6004
+// 后回退 /v2 成功时，及时撤销旧路径留下的账号级冷却显示，避免状态页误报。
+func (p *Pool) ClearSameModelSoftRate(uid string) {
+	if uid == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.coolKind != CoolSoft || !strings.HasPrefix(e.reason, "429 rate limit") {
+		return
+	}
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+	p.dirty.Store(true)
+}
+
+
+// NoteModelSuccess 记录 (账号, 模型) 的真实成功：只清除该模型在 modelCooldowns
+// 中的条目（无论 6004 还是 11102），其他模型条目保持不动。6004 的上游重置墙钟
+// 是限流时的权威信息，但同一模型再次成功已经证明它当前可用，应允许状态页和选号
+// 立即回到健康态，而不是继续等旧截止时间。账号级 until 不在此处处理。
+func (p *Pool) NoteModelSuccess(uid, model string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || len(e.modelCooldowns) == 0 {
+		return
+	}
+	if _, exists := e.modelCooldowns[model]; !exists {
+		return
+	}
+	delete(e.modelCooldowns, model)
+	if len(e.modelCooldowns) == 0 {
+		e.modelCooldowns = nil
+	}
+	p.dirty.Store(true)
+}
+
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
 //
 // 语义：
