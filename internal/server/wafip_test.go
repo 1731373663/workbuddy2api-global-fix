@@ -19,8 +19,8 @@ func withWafIPWindow(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { wafIPWindow = prev })
 }
 
-// TestWafIPGateMultiAccountTriggers 状态机单测：窗内两个不同号命中 → 激活；
-// 单号反复命中（任意多次）不触发；激活期内 noteWaf 恒 true（不续期路径）。
+// TestWafIPGateMultiAccountTriggers 状态机单测：窗内三个不同号命中 → 激活；
+// 单号/双号反复命中不触发；激活期内 noteWaf 恒 true（不续期路径）。
 func TestWafIPGateMultiAccountTriggers(t *testing.T) {
 	withWafIPWindow(t, time.Minute)
 	var g wafIPGate
@@ -33,16 +33,19 @@ func TestWafIPGateMultiAccountTriggers(t *testing.T) {
 	if g.active() {
 		t.Fatal("single account must not activate")
 	}
-	// 第二个不同号进入窗内 → 本 call 即达阈值激活并返回 true（轮转在该次
-	// 403 后立即终止——fail-fast 生效点就是阈值命中的那次请求）。
-	if !g.noteWaf("u2") {
+	// 第二个不同号进入窗内仍不触发（Global 单账号/小池不误判 IP 级）；
+	// 第三个不同号才达到阈值并返回 true。
+	if g.noteWaf("u2") {
+		t.Fatalf("two distinct accounts must not activate with threshold=3")
+	}
+	if !g.noteWaf("u3") {
 		t.Fatalf("threshold crossing call must activate and return true")
 	}
 	if !g.active() {
-		t.Fatal("two distinct accounts within window must activate")
+		t.Fatal("three distinct accounts within window must activate")
 	}
 	// 激活期内新命中恒 true（fail-fast 生效），不续期由下条测试验证。
-	if !g.noteWaf("u3") {
+	if !g.noteWaf("u4") {
 		t.Fatal("hits during active window must report active")
 	}
 }
@@ -55,12 +58,13 @@ func TestWafIPGateWindowExpiry(t *testing.T) {
 	var g wafIPGate
 	g.noteWaf("u1")
 	g.noteWaf("u2")
+	g.noteWaf("u3")
 	if !g.active() {
 		t.Fatal("must activate")
 	}
 	// 激活中段再命中：不改变解除时刻（不续期）——记录当前 until 供过期断言前校验
 	// 该命中确实落在窗内（150ms 内必成立）。
-	if !g.noteWaf("u3") {
+	if !g.noteWaf("u4") {
 		t.Fatal("mid-window hit must report active")
 	}
 	time.Sleep(200 * time.Millisecond) // 窗口过期
@@ -68,7 +72,7 @@ func TestWafIPGateWindowExpiry(t *testing.T) {
 		t.Fatal("gate must deactivate after window expiry")
 	}
 	// 解除后单号命中：旧账已清（判定窗在激活时清空），不残留激活。
-	if g.noteWaf("u4") {
+	if g.noteWaf("u5") {
 		t.Fatal("post-expiry single hit must not re-activate (hits cleared on activation)")
 	}
 	if g.active() {
@@ -77,8 +81,8 @@ func TestWafIPGateWindowExpiry(t *testing.T) {
 }
 
 // TestChatWafIPFailFastStopsRotation 端到端验收（任务书第 2 条）：
-// 3 个账号全部 WAF 403 → 第二个号命中即激活 IP 级状态 → 第三个号不再被调用
-// （放大倍数=1：本请求上游调用=2，远小于 MaxRotate=3 轮全打）。同时验证末端
+// 4 个账号全部 WAF 403 → 第三个不同号命中才激活 IP 级状态 → 第四个号不再被调用
+// （本请求上游调用=3，MaxRotate 默认 3 的上限内完成 fail-fast）。同时验证末端
 // 透传语义：空 body → 本地 waf_ip_blocked 可读文案（5755fe3 兜底分支）。
 func TestChatWafIPFailFastStopsRotation(t *testing.T) {
 	withWafIPWindow(t, time.Minute)
@@ -91,14 +95,15 @@ func TestChatWafIPFailFastStopsRotation(t *testing.T) {
 		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u4", AccessToken: "at4", ExpiresAt: 9999999999},
 	)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	// 上游调用必须止步于 2（第二个号触发 IP 级判定即 break；u3 零调用）。
-	// MaxRotate 默认 3：非 fail-fast 路径会打满 3 次（放大倍数=3）。
-	if n := calls.Load(); n != 2 {
-		t.Fatalf("upstream calls=%d want 2 (fail-fast stops rotation at threshold, u3 must not be hit)", n)
+	// 上游调用必须止步于 3（第三个号触发 IP 级判定即 break；u4 零调用）。
+	// MaxRotate 默认 3：非 fail-fast 路径也会打满 3 次，但 u4 证明 break 生效。
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("upstream calls=%d want 3 (fail-fast stops rotation at threshold, u4 must not be hit)", n)
 	}
 	if rec.Code != 503 {
 		t.Fatalf("code=%d want 503", rec.Code)
@@ -106,17 +111,17 @@ func TestChatWafIPFailFastStopsRotation(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "waf ip-level block") {
 		t.Errorf("empty-body 503 must carry readable local waf_ip text: %s", rec.Body)
 	}
-	// IP 级激活期间账号软冷却照常记账（协同不叠加）：两号均 soft_rate 冷却中。
-	for _, uid := range []string{"u1", "u2"} {
+	// IP 级激活期间账号软冷却照常记账（协同不叠加）：三号均 soft_rate 冷却中。
+	for _, uid := range []string{"u1", "u2", "u3"} {
 		st, _ := p.Status(uid)
 		if !st.Cooling || st.Disabled {
 			t.Errorf("uid=%s must soft-cool without disable (IP state coexists, not stacks): %+v", uid, st)
 		}
 	}
-	// u3 从未被调用：不冷却、可选。
-	st3, _ := p.Status("u3")
-	if st3.Cooling {
-		t.Errorf("u3 must not be cooled (never called): %+v", st3)
+	// u4 从未被调用：不冷却、可选。
+	st4, _ := p.Status("u4")
+	if st4.Cooling {
+		t.Errorf("u4 must not be cooled (never called): %+v", st4)
 	}
 }
 

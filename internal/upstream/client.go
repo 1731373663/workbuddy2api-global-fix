@@ -950,7 +950,7 @@ const (
 // 模型级 6004 限流时尝试新路径。后者对齐官方客户端的 /v2 入口，仅在 body
 // 明确为 6004 时触发；普通 429/账号级限流不重复请求。
 func chatFallbackStatus(status int, body string) bool {
-	if status == 404 || status == 405 {
+	if status == 404 || status == 405 || status == http.StatusForbidden {
 		return true
 	}
 	return status == http.StatusTooManyRequests && IsModelRateLimit(body)
