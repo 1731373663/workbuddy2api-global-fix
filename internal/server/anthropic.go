@@ -371,6 +371,7 @@ type anthropicStreamProxy struct {
 	calls     map[int]*responsesCall
 	usage     *UsageDetail
 	finish    string
+	errMsg    string
 }
 
 func newAnthropicStreamProxy(dest http.ResponseWriter, meta *anthropicRequest) *anthropicStreamProxy {
@@ -446,6 +447,10 @@ func (p *anthropicStreamProxy) handle(payload string) {
 	if json.Unmarshal([]byte(payload), &obj) != nil {
 		return
 	}
+	if rawErr, ok := obj["error"]; ok {
+		p.errMsg = anthropicStreamErrorMessage(rawErr)
+		return
+	}
 	if u, ok := obj["usage"].(map[string]any); ok {
 		p.usage = ParseUsage(u)
 	}
@@ -505,20 +510,69 @@ func (p *anthropicStreamProxy) handle(payload string) {
 		}
 	}
 }
-func (p *anthropicStreamProxy) finishStream() {
-	if p.status >= 400 {
-		return
+func anthropicStreamErrorMessage(v any) string {
+	switch t := v.(type) {
+	case string:
+		if strings.TrimSpace(t) != "" {
+			return t
+		}
+	case map[string]any:
+		if msg, _ := t["message"].(string); strings.TrimSpace(msg) != "" {
+			return msg
+		}
+		if raw, err := json.Marshal(t); err == nil {
+			return string(raw)
+		}
 	}
-	p.start()
+	return "upstream stream error"
+}
+
+func (p *anthropicStreamProxy) closeContentBlocks() {
 	if p.textOpen {
 		p.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": p.textIndex})
+		p.textOpen = false
 	}
 	for _, idx := range p.callOrder {
 		call := p.calls[idx]
 		if call != nil && call.added {
 			p.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": p.callIndex[idx]})
+			call.added = false
 		}
 	}
+}
+
+func (p *anthropicStreamProxy) streamError(err error) {
+	if err == nil || p.errMsg != "" {
+		return
+	}
+	p.errMsg = err.Error()
+}
+
+func (p *anthropicStreamProxy) emitError() {
+	body := strings.TrimSpace(p.errMsg)
+	if body == "" {
+		body = strings.TrimSpace(p.buf.String())
+	}
+	if body == "" {
+		body = "upstream request failed"
+	}
+	p.dest.Header().Set("Content-Type", "text/event-stream")
+	p.dest.Header().Set("Cache-Control", "no-cache")
+	p.dest.Header().Set("X-Accel-Buffering", "no")
+	p.emit("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": body}})
+}
+
+func (p *anthropicStreamProxy) finishStream() {
+	if p.status >= 400 && p.errMsg == "" {
+		p.errMsg = strings.TrimSpace(p.buf.String())
+	}
+	if p.errMsg != "" {
+		p.closeContentBlocks()
+		p.emitError()
+		return
+	}
+	p.start()
+	p.closeContentBlocks()
 	p.emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": anthropicStopReason(p.finish), "stop_sequence": nil}, "usage": anthropicUsage(p.usage)})
 	p.emit("message_stop", map[string]any{"type": "message_stop"})
 }

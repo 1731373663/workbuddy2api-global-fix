@@ -169,7 +169,7 @@ func TestChatConversationRequestIDInboundPassthrough(t *testing.T) {
 	}
 }
 
-// TestChatAGlobalPathAndFallbackReuseConvReqID global realm /console → /v2 fallback：
+// TestChatAGlobalPathAndFallbackReuseConvReqID global realm /v2 → /console fallback：
 // 同一 ChatStream 内两条候选路径出站复用同一 conversationRequestID（换路径不改聚合键）。
 func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
 	auth.SetGlobalEnabled(true)
@@ -182,7 +182,7 @@ func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			reqs++
 			headers = append(headers, r.Header.Clone())
-			// 首次路径（console）404 → 触发 fallback 到 /v2。
+			// 首次路径（/v2）404 → 触发 fallback 到 /console。
 			if reqs == 1 {
 				return &http.Response{
 					StatusCode: 404,
@@ -211,18 +211,18 @@ func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
 		t.Fatalf("code=%d body=%s (global /v2 fallback)", rec.Code, rec.Body)
 	}
 	if reqs != 2 {
-		t.Fatalf("reqs=%d want 2 (console 404 → fallback /v2)", reqs)
+		t.Fatalf("reqs=%d want 2 (/v2 404 → fallback /console)", reqs)
 	}
 	if headers[0].Get("X-Conversation-Request-ID") == "" {
-		t.Fatal("console attempt missing X-Conversation-Request-ID")
+		t.Fatal("first attempt missing X-Conversation-Request-ID")
 	}
 	if headers[0].Get("X-Conversation-Request-ID") != headers[1].Get("X-Conversation-Request-ID") {
-		t.Errorf("console vs /v2 fallback conversationRequestID differ: %q vs %q",
+		t.Errorf("path fallback conversationRequestID differ: %q vs %q",
 			headers[0].Get("X-Conversation-Request-ID"), headers[1].Get("X-Conversation-Request-ID"))
 	}
 	// global 侧头族同样完整：CN/global 同构。
 	if headers[0].Get("X-B3-TraceId") == "" || headers[0].Get("X-B3-SpanId") == "" {
-		t.Errorf("global console attempt missing B3 family: trace=%q span=%q",
+		t.Errorf("global first attempt missing B3 family: trace=%q span=%q",
 			headers[0].Get("X-B3-TraceId"), headers[0].Get("X-B3-SpanId"))
 	}
 }

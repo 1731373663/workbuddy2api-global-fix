@@ -136,3 +136,34 @@ func TestAnthropicAuthHeadersAndCompatiblePaths(t *testing.T) {
 		})
 	}
 }
+
+func TestAnthropicStreamEmitsErrorEventOnUpstreamFailure(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newAnthropicStreamProxy(rec, &anthropicRequest{Model: "deepseek-v4.1-flash"})
+	proxy.WriteHeader(503)
+	_, _ = proxy.Write([]byte("all accounts are temporarily unavailable, please retry later"))
+	proxy.finishStream()
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Fatalf("missing anthropic error event: %s", body)
+	}
+	if !strings.Contains(body, "all accounts are temporarily unavailable") {
+		t.Fatalf("missing upstream error text: %s", body)
+	}
+}
+
+func TestAnthropicStreamEndsWithMessageStop(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newAnthropicStreamProxy(rec, &anthropicRequest{Model: "deepseek-v4.1-flash"})
+	proxy.WriteHeader(200)
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"))
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+	_, _ = proxy.Write([]byte("data: [DONE]\n\n"))
+	proxy.finishStream()
+	body := rec.Body.String()
+	for _, want := range []string{"event: content_block_stop", "event: message_delta", "event: message_stop"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %s in stream: %s", want, body)
+		}
+	}
+}

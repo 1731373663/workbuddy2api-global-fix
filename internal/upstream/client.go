@@ -963,8 +963,8 @@ func chatFallbackStatus(status int, body string) bool {
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// global realm：先打 /v2/chat/completions；404/405、WAF 403 或明确 6004 时再换
+// /console/chat/completions 兜底。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	rc, status, respBody, _, err = c.ChatStreamContextDetail(context.Background(), a, body, clientIP, meta)
 	return rc, status, respBody, err
@@ -999,7 +999,7 @@ func (c *Client) ChatStreamContextDetail(ctx context.Context, a *auth.Auth, body
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
+	// global 首次路径 404/405、WAF 403 或 6004 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	info.ReasoningEffort = reasoningEffortFromBody(prepared)
@@ -1070,10 +1070,10 @@ func (c *Client) ChatStreamContextDetail(ctx context.Context, a *auth.Auth, body
 }
 
 // chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
+// global → [/v2, console]（/v2 为当前实测主路，console 仅兜底）；cn → [/v2]（单元素，现状）。
 func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
+		return []string{chatCompletionsPath, globalChatConsolePath}
 	}
 	return []string{chatCompletionsPath}
 }

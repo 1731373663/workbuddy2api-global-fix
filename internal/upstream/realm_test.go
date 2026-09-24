@@ -34,9 +34,9 @@ func globalAcct() *auth.Auth {
 	return &auth.Auth{AccessToken: "at", RefreshToken: "rt", UID: "g1", Domain: "www.workbuddy.ai"}
 }
 
-// TestGlobalChatUsesConsolePathAndBase 断言 global 账号的 chat 打到 ChatBaseGlobal + /console/chat/completions，
+// TestGlobalChatUsesV2PathAndBase 断言 global 账号的 chat 首选 ChatBaseGlobal + /v2/chat/completions，
 // 且首条消息非 system 时自动补兜底 system（ensureConsoleSystem）。
-func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
+func TestGlobalChatUsesV2PathAndBase(t *testing.T) {
 	var gotPath, gotOrigin, gotModel string
 	var gotMsgs []map[string]any
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,8 +73,8 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 	rc.Close()
 
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
 	if gotOrigin != "https://www.workbuddy.ai" {
 		t.Errorf("global chat Origin=%q want https://www.workbuddy.ai", gotOrigin)
@@ -88,12 +88,12 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 }
 
-// TestGlobalChatFallsBackToV2Path 断言 /console 404 时 fallback /v2/chat/completions（同一 base 二次请求）。
-func TestGlobalChatFallsBackToV2Path(t *testing.T) {
+// TestGlobalChatFallsBackToConsolePath 断言 /v2 404 时 fallback /console/chat/completions（同一 base 二次请求）。
+func TestGlobalChatFallsBackToConsolePath(t *testing.T) {
 	var calls []string
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Path)
-		if r.URL.Path == "/console/chat/completions" {
+		if r.URL.Path == "/v2/chat/completions" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(404)
 			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
@@ -116,18 +116,18 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 		t.Fatalf("chat fallback: status=%d err=%v", status, err)
 	}
 	rc.Close()
-	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
-		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
+	if len(calls) != 2 || calls[0] != "/v2/chat/completions" || calls[1] != "/console/chat/completions" {
+		t.Errorf("chat fallback calls=%v want [/v2, console]", calls)
 	}
 }
 
-// TestGlobalChatFallsBackToV2On6004 断言 /console 返回明确 6004 模型限流时，
-// 同一请求会尝试官方客户端使用的 /v2 路径，而不是直接把 429 返回给客户端。
-func TestGlobalChatFallsBackToV2On6004(t *testing.T) {
+// TestGlobalChatFallsBackToConsoleOn6004 断言 /v2 返回明确 6004 模型限流时，
+// 同一请求会尝试 /console 路径，而不是直接把 429 返回给客户端。
+func TestGlobalChatFallsBackToConsoleOn6004(t *testing.T) {
 	var calls []string
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Path)
-		if r.URL.Path == "/console/chat/completions" {
+		if r.URL.Path == "/v2/chat/completions" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"code":6004,"msg":"usage exceeds frequency limit"}`))
@@ -150,8 +150,8 @@ func TestGlobalChatFallsBackToV2On6004(t *testing.T) {
 		t.Fatalf("6004 chat fallback: status=%d err=%v", status, err)
 	}
 	rc.Close()
-	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
-		t.Errorf("6004 chat fallback calls=%v want [console, v2]", calls)
+	if len(calls) != 2 || calls[0] != "/v2/chat/completions" || calls[1] != "/console/chat/completions" {
+		t.Errorf("6004 chat fallback calls=%v want [/v2, console]", calls)
 	}
 }
 
@@ -177,8 +177,8 @@ func TestGlobalChatDoesNotFallbackOnPlain429(t *testing.T) {
 	if status != http.StatusTooManyRequests || err == nil {
 		t.Fatalf("plain 429: status=%d err=%v want 429 + error", status, err)
 	}
-	if len(calls) != 1 || calls[0] != "/console/chat/completions" {
-		t.Errorf("plain 429 calls=%v want only [console]", calls)
+	if len(calls) != 1 || calls[0] != "/v2/chat/completions" {
+		t.Errorf("plain 429 calls=%v want only [/v2]", calls)
 	}
 }
 
@@ -324,13 +324,16 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`))
-		case strings.HasSuffix(r.URL.Path, "/console/chat/completions"):
-			globalBody, _ = io.ReadAll(r.Body)
+		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
+			if r.Header.Get("X-User-Id") == "g1" {
+				globalBody, _ = io.ReadAll(r.Body)
+			} else {
+				cnBody, _ = io.ReadAll(r.Body)
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
-		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
-			cnBody, _ = io.ReadAll(r.Body)
+		case strings.HasSuffix(r.URL.Path, "/console/chat/completions"):
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
