@@ -366,6 +366,7 @@ type anthropicStreamProxy struct {
 	textOpen  bool
 	textIndex int
 	text      strings.Builder
+	nextIndex int
 	callIndex map[int]int
 	callOrder []int
 	calls     map[int]*responsesCall
@@ -377,6 +378,11 @@ type anthropicStreamProxy struct {
 func newAnthropicStreamProxy(dest http.ResponseWriter, meta *anthropicRequest) *anthropicStreamProxy {
 	fl, _ := dest.(http.Flusher)
 	return &anthropicStreamProxy{dest: dest, fl: fl, meta: meta, calls: map[int]*responsesCall{}, callIndex: map[int]int{}}
+}
+func (p *anthropicStreamProxy) allocIndex() int {
+	i := p.nextIndex
+	p.nextIndex++
+	return i
 }
 func (p *anthropicStreamProxy) Header() http.Header { return p.dest.Header() }
 func (p *anthropicStreamProxy) WriteHeader(code int) {
@@ -439,7 +445,7 @@ func (p *anthropicStreamProxy) openText() {
 	}
 	p.start()
 	p.textOpen = true
-	p.textIndex = len(p.callOrder) + 1
+	p.textIndex = p.allocIndex()
 	p.emit("content_block_start", map[string]any{"type": "content_block_start", "index": p.textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
 }
 func (p *anthropicStreamProxy) handle(payload string) {
@@ -489,7 +495,6 @@ func (p *anthropicStreamProxy) handle(payload string) {
 				call = &responsesCall{}
 				p.calls[idx] = call
 				p.callOrder = append(p.callOrder, idx)
-				p.callIndex[idx] = len(p.callOrder)
 			}
 			fn, _ := tc["function"].(map[string]any)
 			if id, _ := tc["id"].(string); id != "" {
@@ -501,11 +506,17 @@ func (p *anthropicStreamProxy) handle(payload string) {
 			if !call.added && call.name != "" {
 				call.added = true
 				p.start()
+				p.callIndex[idx] = p.allocIndex()
 				p.emit("content_block_start", map[string]any{"type": "content_block_start", "index": p.callIndex[idx], "content_block": map[string]any{"type": "tool_use", "id": call.callID, "name": call.name, "input": map[string]any{}}})
+				if pending := call.args.String(); pending != "" {
+					p.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": p.callIndex[idx], "delta": map[string]any{"type": "input_json_delta", "partial_json": pending}})
+				}
 			}
 			if args, _ := fn["arguments"].(string); args != "" {
 				call.args.WriteString(args)
-				p.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": p.callIndex[idx], "delta": map[string]any{"type": "input_json_delta", "partial_json": args}})
+				if call.added {
+					p.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": p.callIndex[idx], "delta": map[string]any{"type": "input_json_delta", "partial_json": args}})
+				}
 			}
 		}
 	}
@@ -565,6 +576,19 @@ func (p *anthropicStreamProxy) emitError() {
 func (p *anthropicStreamProxy) finishStream() {
 	if p.status >= 400 && p.errMsg == "" {
 		p.errMsg = strings.TrimSpace(p.buf.String())
+	}
+	if p.errMsg == "" {
+		for _, idx := range p.callOrder {
+			call := p.calls[idx]
+			if call == nil || !call.added {
+				continue
+			}
+			args := strings.TrimSpace(call.args.String())
+			if args != "" && !json.Valid([]byte(args)) {
+				p.errMsg = "upstream ended with incomplete tool call arguments"
+				break
+			}
+		}
 	}
 	if p.errMsg != "" {
 		p.closeContentBlocks()

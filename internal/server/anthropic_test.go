@@ -167,3 +167,57 @@ func TestAnthropicStreamEndsWithMessageStop(t *testing.T) {
 		}
 	}
 }
+
+func TestAnthropicStreamTextThenToolUsesDistinctBlockIndexes(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newAnthropicStreamProxy(rec, &anthropicRequest{Model: "deepseek-v4.1-flash"})
+	proxy.WriteHeader(200)
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"starting\"},\"finish_reason\":null}]}\n\n"))
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\"}}]},\"finish_reason\":null}]}\n\n"))
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+	_, _ = proxy.Write([]byte("data: [DONE]\n\n"))
+	proxy.finishStream()
+	body := rec.Body.String()
+	textBlock := -1
+	toolBlock := -1
+	for _, frame := range strings.Split(body, "\n\n") {
+		if !strings.HasPrefix(frame, "event: content_block_start\n") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(frame, "event: content_block_start\n"))
+		payload = strings.TrimPrefix(payload, "data: ")
+		var ev map[string]any
+		if json.Unmarshal([]byte(payload), &ev) != nil {
+			continue
+		}
+		index, _ := ev["index"].(float64)
+		block, _ := ev["content_block"].(map[string]any)
+		switch block["type"] {
+		case "text":
+			textBlock = int(index)
+		case "tool_use":
+			toolBlock = int(index)
+		}
+	}
+	if textBlock != 0 || toolBlock != 1 {
+		t.Fatalf("text and tool_use blocks must use distinct monotonic indexes: %s", body)
+	}
+	if !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("stream did not finish cleanly: %s", body)
+	}
+}
+
+func TestAnthropicStreamIncompleteToolArgumentsEndsWithError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newAnthropicStreamProxy(rec, &anthropicRequest{Model: "deepseek-v4.1-flash"})
+	proxy.WriteHeader(200)
+	_, _ = proxy.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\"}}]},\"finish_reason\":null}]}\n\n"))
+	proxy.finishStream()
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Fatalf("incomplete tool call must emit an error event: %s", body)
+	}
+	if strings.Contains(body, "event: message_stop") {
+		t.Fatalf("incomplete tool call must not look like a clean completion: %s", body)
+	}
+}
