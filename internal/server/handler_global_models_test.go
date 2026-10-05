@@ -117,7 +117,7 @@ func TestModelListTwoFamilies(t *testing.T) {
 	for _, m := range resp.Data {
 		id, _ := m["id"].(string)
 		switch {
-		case strings.HasPrefix(id, "global:"):
+		case strings.HasPrefix(id, "global:") || isGPTModelName(id):
 			globIDs = append(globIDs, strings.TrimPrefix(id, "global:"))
 		case strings.HasPrefix(id, "cn:"):
 			cnIDs = append(cnIDs, strings.TrimPrefix(id, "cn:"))
@@ -174,7 +174,7 @@ func TestModelListNoGlobalAccountEmpty(t *testing.T) {
 	got := h.modelList()
 	var globIDs []string
 	for _, m := range got {
-		if id, ok := m["id"].(string); ok && strings.HasPrefix(id, "global:") {
+		if id, ok := m["id"].(string); ok && (strings.HasPrefix(id, "global:") || isGPTModelName(id)) {
 			globIDs = append(globIDs, strings.TrimPrefix(id, "global:"))
 		}
 	}
@@ -202,7 +202,7 @@ func TestModelListProbeFailureEmpty(t *testing.T) {
 	got := h.modelList()
 	var globIDs []string
 	for _, m := range got {
-		if id, ok := m["id"].(string); ok && strings.HasPrefix(id, "global:") {
+		if id, ok := m["id"].(string); ok && (strings.HasPrefix(id, "global:") || isGPTModelName(id)) {
 			globIDs = append(globIDs, strings.TrimPrefix(id, "global:"))
 		}
 	}

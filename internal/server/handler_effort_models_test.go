@@ -103,11 +103,11 @@ func TestModelListEffortFieldsGlobalRemote(t *testing.T) {
 		}
 	}
 	// 远端下发的 gpt-5.4 effort 权威透出。
-	if !reflect.DeepEqual(byID["global:gpt-5.4"]["reasoning_supported_efforts"], []string{"low", "medium", "high", "xhigh"}) {
-		t.Errorf("gpt-5.4 remote efforts=%v want [low medium high xhigh]", byID["global:gpt-5.4"]["reasoning_supported_efforts"])
+	if !reflect.DeepEqual(byID["gpt-5.4"]["reasoning_supported_efforts"], []string{"low", "medium", "high", "xhigh"}) {
+		t.Errorf("gpt-5.4 remote efforts=%v want [low medium high xhigh]", byID["gpt-5.4"]["reasoning_supported_efforts"])
 	}
-	if byID["global:gpt-5.4"]["reasoning_default_effort"] != "high" {
-		t.Errorf("gpt-5.4 remote default=%v want high", byID["global:gpt-5.4"]["reasoning_default_effort"])
+	if byID["gpt-5.4"]["reasoning_default_effort"] != "high" {
+		t.Errorf("gpt-5.4 remote default=%v want high", byID["gpt-5.4"]["reasoning_default_effort"])
 	}
 	// 探测独有的 probe-only-x 也透出远程档位。
 	if !reflect.DeepEqual(byID["global:probe-only-x"]["reasoning_supported_efforts"], []string{"low"}) {

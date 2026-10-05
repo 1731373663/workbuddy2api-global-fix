@@ -395,6 +395,20 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
+// isGPTModelID reports whether a bare upstream model id is a GPT-family model.
+// GPT models are only available on the global realm.
+func isGPTModelID(id string) bool {
+  return strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "gpt-")
+}
+
+// listedModelID returns the public model id. GPT models are exposed without
+// the realm prefix; all other models keep their realm prefix for routing.
+func listedModelID(realm, bare string) string {
+  if realm == "global" && isGPTModelID(bare) {
+    return bare
+  }
+  return realm + ":" + bare
+}
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
@@ -402,8 +416,11 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		if isGPTModelID(mi.ID) {
+			continue
+		}
 		entry := map[string]any{
-			"id":       "cn:" + mi.ID,
+			"id":       listedModelID("cn", mi.ID),
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "workbuddy",
@@ -447,7 +464,7 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":       "global:" + id,
+				"id":       listedModelID("global", id),
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",

@@ -88,7 +88,7 @@ func TestModelListGlobalContextLengthLookup(t *testing.T) {
 
 	byID := map[string]map[string]any{}
 	for _, m := range h.modelList() {
-		if id, ok := m["id"].(string); ok && len(id) > 7 && id[:7] == "global:" {
+		if id, ok := m["id"].(string); ok && (len(id) > 7 && id[:7] == "global:" || isGPTModelName(id)) {
 			byID[id] = m
 		}
 	}
@@ -97,10 +97,10 @@ func TestModelListGlobalContextLengthLookup(t *testing.T) {
 		t.Fatal("no global entries from probe")
 	}
 	// 富条目真实值权威（400000/100000 远端下发，覆盖知识表 1050000/128000）。
-	if c := byID["global:gpt-5.4"]["context_length"]; c != int64(400000) {
+	if c := byID["gpt-5.4"]["context_length"]; c != int64(400000) {
 		t.Errorf("gpt-5.4 context_length=%v want 400000 (probe value wins)", c)
 	}
-	if o := byID["global:gpt-5.4"]["max_output_tokens"]; o != int64(100000) {
+	if o := byID["gpt-5.4"]["max_output_tokens"]; o != int64(100000) {
 		t.Errorf("gpt-5.4 max_output_tokens=%v want 100000 (probe value wins)", o)
 	}
 }
@@ -121,11 +121,11 @@ func TestModelListGlobalNarrowContextLookup(t *testing.T) {
 
 	byID := map[string]map[string]any{}
 	for _, m := range h.modelList() {
-		if id, ok := m["id"].(string); ok && len(id) > 7 && id[:7] == "global:" {
+		if id, ok := m["id"].(string); ok && (len(id) > 7 && id[:7] == "global:" || isGPTModelName(id)) {
 			byID[id] = m
 		}
 	}
-	if c := byID["global:gpt-5.6-luna"]["context_length"]; c != int64(1050000) {
+	if c := byID["gpt-5.6-luna"]["context_length"]; c != int64(1050000) {
 		t.Errorf("narrow gpt-5.6-luna context_length=%v want 1050000 (knowledge table, not 131072)", c)
 	}
 	if c := byID["global:narrow-unknown"]["context_length"]; c != int64(1000000) {

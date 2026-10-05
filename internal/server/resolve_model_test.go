@@ -11,7 +11,11 @@ func TestResolveModel(t *testing.T) {
 		wantBare     string
 	}{
 		{"cn:glm-5.2", "cn", "glm-5.2"},
+		{"gpt-5.4", "global", "gpt-5.4"},
+		{"cn:gpt-5.4", "global", "gpt-5.4"},
 		{"global:gpt-5.4", "global", "gpt-5.4"},
+		{"gpt-5", "global", "gpt-5"},
+		{"cn:gpt-5", "global", "gpt-5"},
 		{"glm-5.2", "cn", "glm-5.2"},
 		{"deepseek:v3", "cn", "deepseek:v3"}, // 冒号前段不在枚举内，不剥离
 	}
