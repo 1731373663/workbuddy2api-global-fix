@@ -393,6 +393,18 @@ func convertResponsesTool(t map[string]any) map[string]any {
 
 // responsesToChat 把 Responses 请求体翻译成 Chat Completions 请求体。
 // 兼容入口：无本地历史时等价 responsesToChatWithHistory(body, nil)。
+
+func normalizeToolArguments(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "{}", true
+	}
+	if !json.Valid([]byte(raw)) {
+		return "{}", false
+	}
+	return raw, true
+}
+
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	return responsesToChatWithHistory(body, nil)
 }
@@ -475,6 +487,8 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 		pendingReasoning.Reset()
 	}
 
+	knownCalls := map[string]bool{}
+	skippedCalls := map[string]bool{}
 	appendInput := func(items []map[string]any) {
 		logResponsesInputShape(items)
 		for _, it := range items {
@@ -488,8 +502,20 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 					callID, _ = it["id"].(string)
 				}
 				name, _ := it["name"].(string)
-				name = encodeToolName(name)
+				if callID == "" || strings.TrimSpace(name) == "" {
+					log.Printf("WARN: [responses] dropping malformed function_call call_id=%q name=%q", callID, name)
+					if callID != "" {
+						skippedCalls[callID] = true
+					}
+					continue
+				}
 				args, _ := it["arguments"].(string)
+				args, ok := normalizeToolArguments(args)
+				if !ok {
+					log.Printf("WARN: [responses] invalid function_call arguments call_id=%s name=%s; replaced with {}", callID, name)
+				}
+				knownCalls[callID] = true
+				name = encodeToolName(name)
 				pendingCalls = append(pendingCalls, map[string]any{
 					"id": callID, "type": "function",
 					"function": map[string]any{"name": name, "arguments": args},
@@ -516,8 +542,12 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 					"function": map[string]any{"name": "tool_search", "arguments": args},
 				})
 			case "function_call_output":
-				flushAssistant()
 				callID, _ := it["call_id"].(string)
+				if callID == "" || skippedCalls[callID] || !knownCalls[callID] {
+					log.Printf("WARN: [responses] dropping orphan function_call_output call_id=%q", callID)
+					continue
+				}
+				flushAssistant()
 				messages = append(messages, map[string]any{
 					"role": "tool", "tool_call_id": callID, "content": toolOutputToChat(it["output"]),
 				})

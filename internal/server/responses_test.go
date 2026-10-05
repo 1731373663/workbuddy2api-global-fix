@@ -645,3 +645,44 @@ func TestResponsesToolSearchBackfillsMissingCuaRepl(t *testing.T) {
 		t.Fatalf("missing cua_repl fallback: %v", tools)
 	}
 }
+func TestResponsesInvalidToolArgumentsNormalized(t *testing.T) {
+	body := []byte(`{"model":"cn:deepseek-v4.1-flash","input":[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{bad"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages len=%d want 2: %v", len(msgs), msgs)
+	}
+	assistant, _ := msgs[0].(map[string]any)
+	calls, _ := assistant["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("calls=%v", calls)
+	}
+	call, _ := calls[0].(map[string]any)
+	fn, _ := call["function"].(map[string]any)
+	if fn["arguments"] != "{}" {
+		t.Fatalf("arguments=%v want {}", fn["arguments"])
+	}
+}
+
+func TestResponsesOrphanToolOutputDropped(t *testing.T) {
+	body := []byte(`{"model":"cn:deepseek-v4.1-flash","input":[{"type":"message","role":"user","content":"hi"},{"type":"function_call_output","call_id":"missing","output":"orphan"}]}`)
+	out, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("responsesToChat: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := chat["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages len=%d want 1: %v", len(msgs), msgs)
+	}
+}
