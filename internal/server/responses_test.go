@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -684,5 +685,40 @@ func TestResponsesOrphanToolOutputDropped(t *testing.T) {
 	msgs, _ := chat["messages"].([]any)
 	if len(msgs) != 1 {
 		t.Fatalf("messages len=%d want 1: %v", len(msgs), msgs)
+	}
+}
+
+func TestTrimResponsesToolHistory(t *testing.T) {
+	items := make([]map[string]any, 0, 1410)
+	for i := 0; i < 705; i++ {
+		id := fmt.Sprintf("call_%d", i)
+		items = append(items, map[string]any{
+			"type": "function_call", "call_id": id, "name": "shell", "arguments": "{}",
+		})
+		items = append(items, map[string]any{
+			"type": "function_call_output", "call_id": id, "output": "ok",
+		})
+	}
+	got := trimResponsesToolHistory(items)
+	calls := 0
+	outputs := 0
+	first := ""
+	for _, item := range got {
+		typ, _ := item["type"].(string)
+		switch typ {
+		case "function_call":
+			calls++
+			if first == "" {
+				first, _ = item["call_id"].(string)
+			}
+		case "function_call_output":
+			outputs++
+		}
+	}
+	if calls != responsesMaxToolPairs || outputs != responsesMaxToolPairs {
+		t.Fatalf("calls=%d outputs=%d want %d", calls, outputs, responsesMaxToolPairs)
+	}
+	if first != "call_5" {
+		t.Fatalf("first kept call_id=%q want call_5", first)
 	}
 }

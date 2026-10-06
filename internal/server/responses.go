@@ -394,6 +394,53 @@ func convertResponsesTool(t map[string]any) map[string]any {
 // responsesToChat 把 Responses 请求体翻译成 Chat Completions 请求体。
 // 兼容入口：无本地历史时等价 responsesToChatWithHistory(body, nil)。
 
+const responsesMaxToolPairs = 700
+
+func responsesToolCallID(it map[string]any) string {
+	id, _ := it["call_id"].(string)
+	if id == "" {
+		id, _ = it["id"].(string)
+	}
+	return id
+}
+
+func trimResponsesToolHistory(items []map[string]any) []map[string]any {
+	ids := make([]string, 0)
+	seen := map[string]bool{}
+	for _, it := range items {
+		typ, _ := it["type"].(string)
+		if typ != "function_call" && typ != "tool_search_call" {
+			continue
+		}
+		id := responsesToolCallID(it)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) <= responsesMaxToolPairs {
+		return items
+	}
+	drop := map[string]bool{}
+	for _, id := range ids[:len(ids)-responsesMaxToolPairs] {
+		drop[id] = true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		typ, _ := it["type"].(string)
+		switch typ {
+		case "function_call", "tool_search_call",
+			"function_call_output", "tool_search_output":
+			if drop[responsesToolCallID(it)] {
+				continue
+			}
+		}
+		out = append(out, it)
+	}
+	log.Printf("WARN: [responses] trimmed oldest tool history: dropped_calls=%d kept_calls=%d", len(drop), responsesMaxToolPairs)
+	return out
+}
+
 func normalizeToolArguments(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -607,6 +654,7 @@ func responsesToChatWithHistory(body []byte, prior []any) ([]byte, *responsesReq
 			if err := json.Unmarshal(req.Input, &items); err != nil {
 				return nil, nil, fmt.Errorf("parse input: %w", err)
 			}
+			items = trimResponsesToolHistory(items)
 			appendInput(items)
 		}
 	}
