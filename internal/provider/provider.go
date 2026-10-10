@@ -16,19 +16,21 @@ import (
 
 // Config is one third-party OpenAI-compatible provider.
 type Config struct {
-	Name      string `json:"name"`
-	BaseURL   string `json:"base_url"`
-	APIKey    string `json:"api_key"`
-	ModelsURL string `json:"models_url,omitempty"`
+	Name      string  `json:"name"`
+	BaseURL   string  `json:"base_url"`
+	APIKey    string  `json:"api_key"`
+	ModelsURL string  `json:"models_url,omitempty"`
+	Models    []Model `json:"models,omitempty"`
 	// Protocol selects the upstream API shape: chat_completions (default) or responses.
 	Protocol string `json:"protocol,omitempty"`
 }
 
-// Model is one model exposed by a provider.
+// Model is one model exposed by a provider. ID is the upstream model id used for
+// requests; Name is the public display name shown to clients.
 type Model struct {
-	ID      string
-	Name    string
-	OwnedBy string
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	OwnedBy string `json:"owned_by,omitempty"`
 }
 
 // Client forwards chat requests to configured third-party providers.
@@ -106,6 +108,45 @@ func (c *Client) Names() []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// ConfiguredModels returns the saved model list for a provider. When the
+// provider has no saved list yet, it falls back to fetching from the upstream
+// /models endpoint so the first setup still works.
+func (c *Client) ConfiguredModels(ctx context.Context, name string) ([]Model, error) {
+	if c == nil {
+		return nil, fmt.Errorf("provider client disabled")
+	}
+	cfg, ok := c.providers[strings.TrimSpace(name)]
+	if !ok {
+		return nil, fmt.Errorf("provider %q not found", name)
+	}
+	if len(cfg.Models) > 0 {
+		return cfg.Models, nil
+	}
+	return c.listModels(ctx, cfg)
+}
+
+// ResolveModel maps a public display name back to the upstream model id. When
+// the model is not in the saved list it is passed through unchanged so direct
+// ids still work.
+func (c *Client) ResolveModel(providerName, publicName string) string {
+	if c == nil {
+		return publicName
+	}
+	cfg, ok := c.providers[strings.TrimSpace(providerName)]
+	if !ok {
+		return publicName
+	}
+	for _, m := range cfg.Models {
+		if m.ID == publicName {
+			return publicName
+		}
+		if strings.TrimSpace(m.Name) == publicName {
+			return m.ID
+		}
+	}
+	return publicName
 }
 
 // ListModels fetches models from all configured providers. A failing provider is

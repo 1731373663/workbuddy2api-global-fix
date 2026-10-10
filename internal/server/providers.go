@@ -2,25 +2,15 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"workbuddy2api/internal/provider"
 	"workbuddy2api/internal/upstream"
 )
-
-var providerModelsCache struct {
-	sync.RWMutex
-	models  map[string][]provider.Model
-	errs    map[string]error
-	fetched time.Time
-}
-
-const providerModelsTTL = 10 * time.Minute
 
 func splitProviderModel(model string) (string, string, bool) {
 	model = strings.TrimSpace(model)
@@ -41,16 +31,24 @@ func (h *Handler) providerModelList() []map[string]any {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	models := h.fetchProviderModels(ctx)
 	out := make([]map[string]any, 0)
-	for name, list := range models {
+	for _, name := range h.cfg.Providers.Names() {
+		list, err := h.cfg.Providers.ConfiguredModels(ctx, name)
+		if err != nil {
+			log.Printf("WARN: [provider] list models provider=%s: %v", name, err)
+			continue
+		}
 		for _, model := range list {
+			public := model.ID
+			if strings.TrimSpace(model.Name) != "" {
+				public = model.Name
+			}
 			owned := model.OwnedBy
 			if owned == "" {
 				owned = name
 			}
 			out = append(out, map[string]any{
-				"id":       name + ":" + model.ID,
+				"id":       name + ":" + public,
 				"object":   "model",
 				"created":  int64(1753600000),
 				"owned_by": owned,
@@ -61,29 +59,10 @@ func (h *Handler) providerModelList() []map[string]any {
 	return out
 }
 
-func (h *Handler) fetchProviderModels(ctx context.Context) map[string][]provider.Model {
-	providerModelsCache.RLock()
-	if providerModelsCache.fetched.After(time.Time{}) && time.Since(providerModelsCache.fetched) < providerModelsTTL {
-		out := providerModelsCache.models
-		providerModelsCache.RUnlock()
-		return out
-	}
-	providerModelsCache.RUnlock()
-	out, errs := h.cfg.Providers.ListModelsDetailed(ctx)
-	for name, err := range errs {
-		log.Printf("WARN: [provider] list models provider=%s: %v", name, err)
-	}
-	providerModelsCache.Lock()
-	providerModelsCache.models = out
-	providerModelsCache.errs = errs
-	providerModelsCache.fetched = time.Now()
-	providerModelsCache.Unlock()
-	return out
-}
-
 // providerChat handles a request addressed as "<provider>:<model>".
 func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []byte, stream bool, st *chatStat, providerName, bareModel string) {
-	rc, status, respBody, err := h.cfg.Providers.Stream(r.Context(), providerName, bareModel, body)
+	upstreamModel := h.cfg.Providers.ResolveModel(providerName, bareModel)
+	rc, status, respBody, err := h.cfg.Providers.Stream(r.Context(), providerName, upstreamModel, body)
 	st.status = status
 	st.uid = "provider:" + providerName
 	st.detail.Endpoint = "/" + providerName + "/chat/completions"
@@ -116,7 +95,20 @@ func (h *Handler) providerChat(w http.ResponseWriter, r *http.Request, body []by
 		st.detail.FinishReason = stats.FinishReason()
 		return
 	}
-	resp, err := upstream.Aggregate(rc)
+	raw, readErr := io.ReadAll(io.LimitReader(rc, 16<<20))
+	if readErr != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_read", readErr.Error())
+		st.status = http.StatusBadGateway
+		st.detail.ErrorCode = "upstream_read"
+		st.detail.ErrorMessage = readErr.Error()
+		return
+	}
+	var resp map[string]any
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "data:") {
+		resp, err = upstream.Aggregate(strings.NewReader(string(raw)))
+	} else {
+		err = json.Unmarshal(raw, &resp)
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 		st.status = http.StatusBadGateway
