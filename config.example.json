@@ -29,7 +29,14 @@
     "chat_base": "",
     "billing_base": ""
   },
-  "upstream": {
+  "providers": [
+    {
+      "name": "example",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "sk-xxx",
+      "protocol": "chat_completions"
+    }
+  ],  "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 60,
     "idle_timeout_seconds": 300,

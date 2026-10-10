@@ -21,6 +21,7 @@ import (
 	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/provider"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -55,6 +56,9 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Providers third-party OpenAI-compatible upstreams (optional).
+	Providers *provider.Client
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -398,17 +402,18 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // isGPTModelID reports whether a bare upstream model id is a GPT-family model.
 // GPT models are only available on the global realm.
 func isGPTModelID(id string) bool {
-  return strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "gpt-")
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "gpt-")
 }
 
 // listedModelID returns the public model id. GPT models are exposed without
 // the realm prefix; all other models keep their realm prefix for routing.
 func listedModelID(realm, bare string) string {
-  if realm == "global" && isGPTModelID(bare) {
-    return bare
-  }
-  return realm + ":" + bare
+	if realm == "global" && isGPTModelID(bare) {
+		return bare
+	}
+	return realm + ":" + bare
 }
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
@@ -447,6 +452,9 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		out = append(out, entry)
 	}
+	// Third-party providers: expose each configured model as "<provider>:<model>".
+	out = append(out, h.providerModelList()...)
+
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 探测结果（fetchGlobalModels 纯动态，失败/无号 → 空）；无 global 账号时
 	// 空名单且零上游调用。
@@ -617,6 +625,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	if h.cfg.Providers != nil {
+		if providerName, providerModel, ok := splitProviderModel(peek.Model); ok && h.cfg.Providers.Has(providerName) {
+			// Provider requests bypass the WorkBuddy account pool entirely.
+			realm, bareModel = "provider:"+providerName, providerModel
+			st := newChatStat(time.Now(), body, peek.Stream)
+			st.realm = realm
+			st.requestID = chatRequestID(r, body, peek.Model)
+			st.detail.Temperature = peek.Temperature
+			st.detail.TopP = peek.TopP
+			st.detail.MaxOutputTokens = peek.MaxTokens
+			if st.detail.MaxOutputTokens == 0 {
+				st.detail.MaxOutputTokens = peek.MaxCompletion
+			}
+			st.detail.ToolCalls = countToolCalls(peek.Messages)
+			st.detail.ImageInputs = countImageInputs(peek.Messages)
+			st.collector = h.cfg.Metrics
+			defer st.done()
+			h.providerChat(w, r, body, peek.Stream, st, providerName, providerModel)
+			return
+		}
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)

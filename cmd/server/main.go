@@ -15,6 +15,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/provider"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -78,7 +79,7 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
-	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// 会话粘性路由（可配关闭）。
@@ -198,6 +199,7 @@ func main() {
 		defer metricsCollector.Flush() // 退出前落盘
 	}
 
+	providerClient := provider.New(cfg.Providers)
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -211,6 +213,7 @@ func main() {
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		Providers:     providerClient,
 		Metrics:       metricsCollector,
 	})
 

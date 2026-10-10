@@ -274,3 +274,32 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`
 - 本项目不授予任何上游（CodeBuddy）接口或服务的权利；使用者仍需自行遵守上游服务条款
 - 本项目的使用同时受上方**免责声明**约束；如免责声明与 MIT License 存在不一致，以免责声明为准
+
+## 接入第三方供应商
+
+网关支持把任意 OpenAI 兼容供应商接入现有 `/v1` 端点。配置 `providers` 数组后，供应商模型会以 `<供应商名>:<模型名>` 出现在 `/v1/models`，也可以直接用于 `/v1/chat/completions`、`/v1/responses` 和 Claude Code 的 `/v1/messages`。
+
+```json
+{
+  "providers": [
+    {
+      "name": "deepseek",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "sk-xxx",
+      "protocol": "chat_completions"
+    },
+    {
+      "name": "my-responses-provider",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "sk-yyy",
+      "protocol": "responses",
+      "models_url": "https://api.example.com/v1/models"
+    }
+  ]
+}
+```
+
+- `protocol` 支持 `chat_completions`（默认）和 `responses`。
+- `models_url` 可选；留空时使用 `<base_url>/models`。
+- 供应商请求不经过 WorkBuddy 账号池，不会触发 WorkBuddy 账号冷却。
+- 修改配置后需要重启网关容器。

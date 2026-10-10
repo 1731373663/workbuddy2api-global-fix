@@ -11,6 +11,7 @@ import (
 
 	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/provider"
 )
 
 // Config 顶层配置。
@@ -59,7 +60,10 @@ type Config struct {
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
 
-	Upstream struct {
+	// Providers third-party OpenAI-compatible upstreams. A configured provider is
+	// exposed as "<name>:<model>" and bypasses the WorkBuddy account pool.
+	Providers []provider.Config `json:"providers"`
+	Upstream  struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
@@ -120,17 +124,17 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
 		// 并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长，默认 "10m"
-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权封顶，默认 "2h"
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长，默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权封顶，默认 "2h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
