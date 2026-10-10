@@ -115,7 +115,10 @@ func (c *Client) ListProviderModels(ctx context.Context, name string) ([]Model, 
 }
 
 func (c *Client) listModels(ctx context.Context, cfg Config) ([]Model, error) {
-	endpoint := cfg.ModelsURL
+	endpoint := strings.TrimRight(strings.TrimSpace(cfg.ModelsURL), "/")
+	if endpoint == "<nil>" || strings.EqualFold(endpoint, "null") {
+		endpoint = ""
+	}
 	if endpoint == "" {
 		endpoint = cfg.BaseURL + "/models"
 	}
@@ -151,6 +154,7 @@ func (c *Client) listModels(ctx context.Context, cfg Config) ([]Model, error) {
 			OwnedBy string `json:"owned_by"`
 		} `json:"models"`
 	}
+	// Normalize the optional models URL. Some GUI/config writers emit "<nil>" for an absent value.
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
@@ -495,6 +499,7 @@ func responsesToChat(raw []byte, model string) ([]byte, error) {
 		} `json:"output"`
 		Usage map[string]any `json:"usage"`
 	}
+	// Normalize the optional models URL. Some GUI/config writers emit "<nil>" for an absent value.
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("parse responses response: %w", err)
 	}

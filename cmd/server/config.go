@@ -63,7 +63,8 @@ type Config struct {
 	// Providers third-party OpenAI-compatible upstreams. A configured provider is
 	// exposed as "<name>:<model>" and bypasses the WorkBuddy account pool.
 	Providers []provider.Config `json:"providers"`
-	Upstream  struct {
+
+	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
@@ -160,6 +161,15 @@ type Config struct {
 	ExpiringSoonDur     time.Duration `json:"-"`
 }
 
+// NormalizeProviders removes empty placeholder values emitted by older GUI versions.
+func (c *Config) NormalizeProviders() {
+	for i := range c.Providers {
+		if strings.EqualFold(strings.TrimSpace(c.Providers[i].ModelsURL), "<nil>") || strings.EqualFold(strings.TrimSpace(c.Providers[i].ModelsURL), "null") {
+			c.Providers[i].ModelsURL = ""
+		}
+	}
+}
+
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
@@ -224,6 +234,7 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	applyEnv(c)
+	c.NormalizeProviders()
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
