@@ -424,6 +424,9 @@ func listedModelID(realm, bare string) string {
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		if !h.modelVisibleForRealm("cn", mi.ID) {
+			continue
+		}
 		if isGPTModelID(mi.ID) {
 			continue
 		}
@@ -474,6 +477,9 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			if !h.modelVisibleForRealm("global", id) {
+				continue
+			}
 			entry := map[string]any{
 				"id":       h.publicModelID("global", id),
 				"object":   "model",

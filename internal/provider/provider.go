@@ -43,7 +43,7 @@ func New(configs []Config) *Client {
 		providers: make(map[string]Config, len(configs)),
 		http: &http.Client{
 			Transport: &http.Transport{
-				Proxy:                 http.ProxyFromEnvironment,
+				Proxy:                 providerProxyFromEnvironment,
 				MaxIdleConns:          64,
 				MaxIdleConnsPerHost:   16,
 				IdleConnTimeout:       90 * time.Second,
@@ -63,6 +63,25 @@ func New(configs []Config) *Client {
 		c.providers[name] = cfg
 	}
 	return c
+}
+
+// providerProxyFromEnvironment ignores loopback HTTP proxies inherited from a
+// host into a container. A common Windows setup exports
+// HTTP(S)_PROXY=http://127.0.0.1:7897; inside Docker that address points at the
+// container itself and every provider request fails unless it is bypassed.
+func providerProxyFromEnvironment(req *http.Request) (*url.URL, error) {
+	if host := req.URL.Hostname(); host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return nil, nil
+	}
+	proxy, err := http.ProxyFromEnvironment(req)
+	if err != nil || proxy == nil {
+		return proxy, err
+	}
+	ph := strings.ToLower(proxy.Hostname())
+	if ph == "127.0.0.1" || ph == "localhost" || ph == "::1" {
+		return nil, nil
+	}
+	return proxy, nil
 }
 
 // Enabled reports whether at least one provider is configured.
@@ -92,14 +111,29 @@ func (c *Client) Names() []string {
 // ListModels fetches models from all configured providers. A failing provider is
 // skipped so one bad supplier cannot hide the others.
 func (c *Client) ListModels(ctx context.Context) map[string][]Model {
+	out, _ := c.ListModelsDetailed(ctx)
+	return out
+}
+
+// ListModelsDetailed is ListModels plus per-provider errors. The returned map
+// still contains only successful providers, so callers can keep the existing
+// one-bad-provider-does-not-hide-the-others behavior while logging the cause.
+func (c *Client) ListModelsDetailed(ctx context.Context) (map[string][]Model, map[string]error) {
 	out := make(map[string][]Model, len(c.providers))
+	errs := make(map[string]error)
 	for name, cfg := range c.providers {
 		models, err := c.listModels(ctx, cfg)
-		if err == nil && len(models) > 0 {
-			out[name] = models
+		if err != nil {
+			errs[name] = err
+			continue
 		}
+		if len(models) == 0 {
+			errs[name] = fmt.Errorf("provider returned an empty model list")
+			continue
+		}
+		out[name] = models
 	}
-	return out
+	return out, errs
 }
 
 // ListProviderModels fetches models from one provider.

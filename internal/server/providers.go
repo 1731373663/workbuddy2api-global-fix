@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 var providerModelsCache struct {
 	sync.RWMutex
 	models  map[string][]provider.Model
+	errs    map[string]error
 	fetched time.Time
 }
 
@@ -61,15 +63,19 @@ func (h *Handler) providerModelList() []map[string]any {
 
 func (h *Handler) fetchProviderModels(ctx context.Context) map[string][]provider.Model {
 	providerModelsCache.RLock()
-	if len(providerModelsCache.models) > 0 && time.Since(providerModelsCache.fetched) < providerModelsTTL {
+	if providerModelsCache.fetched.After(time.Time{}) && time.Since(providerModelsCache.fetched) < providerModelsTTL {
 		out := providerModelsCache.models
 		providerModelsCache.RUnlock()
 		return out
 	}
 	providerModelsCache.RUnlock()
-	out := h.cfg.Providers.ListModels(ctx)
+	out, errs := h.cfg.Providers.ListModelsDetailed(ctx)
+	for name, err := range errs {
+		log.Printf("WARN: [provider] list models provider=%s: %v", name, err)
+	}
 	providerModelsCache.Lock()
 	providerModelsCache.models = out
+	providerModelsCache.errs = errs
 	providerModelsCache.fetched = time.Now()
 	providerModelsCache.Unlock()
 	return out

@@ -29,9 +29,12 @@ func (h *Handler) accountModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"settings": pool.AllAccountModelSettings()})
 		return
 	}
-	acct := h.cfg.Pool.PickByUIDForModel(uid, "")
+	// 查看/编辑模型设置不应依赖账号当前健康度：冷却中的账号仍需要能读回它自己的
+	// 模型名单，否则「模型」按钮会因 6004/soft wait 直接 400，用户无法排队设置
+	// 或取消误关的模型。按 uid 直接取凭证，只做存在性校验。
+	acct := h.cfg.Pool.AuthByUID(uid)
 	if acct == nil {
-		writeOpenAIError(w, http.StatusNotFound, "account_not_found", "account not found or unavailable")
+		writeOpenAIError(w, http.StatusNotFound, "account_not_found", "account not found")
 		return
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)

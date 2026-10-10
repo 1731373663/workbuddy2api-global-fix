@@ -44,3 +44,38 @@ func (h *Handler) modelEnabledForAccount(uid, realm, publicModel string) bool {
 	realModel := h.realModelName(realm, publicModel)
 	return pool.GetAccountModelSettings(uid).ModelEnabled(realModel)
 }
+
+// modelVisibleForRealm reports whether a real model should appear in the public
+// model list for a realm.
+//
+// Account-level model controls are realm-scoped: CN settings must not hide
+// global models, and global settings must not hide CN models. When a realm has
+// at least one account with an explicit enable list, that realm's public list
+// becomes the union of those explicit lists. Accounts without an explicit list
+// in the same realm do not keep every model visible, otherwise disabling a model
+// on the only configured account would have no visible effect.
+func (h *Handler) modelVisibleForRealm(realm, realModel string) bool {
+	realModel = strings.TrimSpace(realModel)
+	if realModel == "" {
+		return false
+	}
+	settings := pool.AllAccountModelSettings()
+	if len(settings) == 0 {
+		return true
+	}
+	seenRealmPolicy := false
+	for uid, s := range settings {
+		acct := h.cfg.Pool.AuthByUID(uid)
+		if acct == nil || acct.Realm() != realm {
+			continue
+		}
+		if len(s.EnabledModels) == 0 {
+			continue
+		}
+		seenRealmPolicy = true
+		if s.ModelEnabled(realModel) {
+			return true
+		}
+	}
+	return !seenRealmPolicy
+}
