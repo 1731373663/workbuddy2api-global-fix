@@ -232,6 +232,13 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
+// SetModelAllowedHook injects per-account model policy used by selection.
+func (p *Pool) SetModelAllowedHook(fn func(uid, model string) bool) {
+	p.mu.Lock()
+	p.modelAllowed = fn
+	p.mu.Unlock()
+}
+
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
@@ -363,6 +370,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 // 用途：handler 区分两种“选不到号”——
 //   - false：真的没有可用账号（冷却/禁用），应立即返回 503；
 //   - true ：账号只是被并发占满，短暂等待名额释放即可继续，不该直接失败。
+//
 // 并发突发的 Codex 多请求场景下，后者占绝大多数，直接 503 会表现为“中途断线”。
 // realm 非空时只统计该域；model 非空时按模型级冷却豁免口径判定。
 func (p *Pool) HealthyButFull(model, realm string) bool {
@@ -389,7 +397,6 @@ func (p *Pool) HealthyButFull(model, realm string) bool {
 	}
 	return false
 }
-
 
 func (p *Pool) ServableNow() bool {
 	return p.servableLocked("")
@@ -455,20 +462,20 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Credits:           e.credits,
 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
-		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
-		Reason:            reason,
-		Disabled:          e.disabled,
-		SuccessCount:      e.successCount,
-		ErrTotal:          e.errTotal,
-		LastSuccessTime:   e.lastSuccess,
-		LastErrTime:       e.lastErr,
-		ConsecutiveFails:  e.consecutiveFails,
-		DegradeUntil:      e.degradeUntil,
-		Until:             e.until,
-		SoftStreak:        e.softStreak,
-		InFlight:          int(e.inFlight.Load()),
-		BreakerFails:      e.fails,
-		BreakerUntil:      e.breakerUntil,
+		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
+		Reason:           reason,
+		Disabled:         e.disabled,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		LastSuccessTime:  e.lastSuccess,
+		LastErrTime:      e.lastErr,
+		ConsecutiveFails: e.consecutiveFails,
+		DegradeUntil:     e.degradeUntil,
+		Until:            e.until,
+		SoftStreak:       e.softStreak,
+		InFlight:         int(e.inFlight.Load()),
+		BreakerFails:     e.fails,
+		BreakerUntil:     e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

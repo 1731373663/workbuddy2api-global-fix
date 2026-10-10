@@ -63,6 +63,7 @@ func main() {
 	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
 	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+	pool.SetAccountModelSettingsPath(filepath.Join(filepath.Dir(cfg.StateFile), "account_models.json"))
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
@@ -81,6 +82,9 @@ func main() {
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	p.SetModelAllowedHook(func(uid, model string) bool {
+		return pool.GetAccountModelSettings(uid).ModelEnabled(model)
+	})
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router

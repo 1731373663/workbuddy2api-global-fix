@@ -122,6 +122,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/v1/messages/count_tokens", h.withAuth(h.anthropicCountTokens))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.anthropicCountTokens))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /v1/account-models", h.withAuth(h.accountModels))
+	h.mux.HandleFunc("GET /v1/account-models/{uid}", h.withAuth(h.accountModels))
+	h.mux.HandleFunc("PUT /v1/account-models/{uid}", h.withAuth(h.accountModelSettingsPut))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("GET /v1/stats/details", h.withAuth(h.statsDetails))
@@ -425,7 +428,7 @@ func (h *Handler) modelList() []map[string]any {
 			continue
 		}
 		entry := map[string]any{
-			"id":       listedModelID("cn", mi.ID),
+			"id":       h.publicModelID("cn", mi.ID),
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "workbuddy",
@@ -472,7 +475,7 @@ func (h *Handler) modelList() []map[string]any {
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
 			entry := map[string]any{
-				"id":       listedModelID("global", id),
+				"id":       h.publicModelID("global", id),
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",
@@ -625,6 +628,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	bareModel = h.realModelName(realm, bareModel)
 	if h.cfg.Providers != nil {
 		if providerName, providerModel, ok := splitProviderModel(peek.Model); ok && h.cfg.Providers.Has(providerName) {
 			// Provider requests bypass the WorkBuddy account pool entirely.

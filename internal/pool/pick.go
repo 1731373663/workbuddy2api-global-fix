@@ -56,6 +56,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if !healthyOf(e) {
 			continue
 		}
+		if reqModel != "" && p.modelAllowed != nil && !p.modelAllowed(e.a.UID, reqModel) {
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
