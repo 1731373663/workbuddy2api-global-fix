@@ -16,11 +16,10 @@ import (
 
 // Config is one third-party OpenAI-compatible provider.
 type Config struct {
-	Name      string  `json:"name"`
-	BaseURL   string  `json:"base_url"`
-	APIKey    string  `json:"api_key"`
-	ModelsURL string  `json:"models_url,omitempty"`
-	Models    []Model `json:"models,omitempty"`
+	Name    string  `json:"name"`
+	BaseURL string  `json:"base_url"`
+	APIKey  string  `json:"api_key"`
+	Models  []Model `json:"models,omitempty"`
 	// Protocol selects the upstream API shape: chat_completions (default) or responses.
 	Protocol string `json:"protocol,omitempty"`
 }
@@ -190,13 +189,7 @@ func (c *Client) ListProviderModels(ctx context.Context, name string) ([]Model, 
 }
 
 func (c *Client) listModels(ctx context.Context, cfg Config) ([]Model, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(cfg.ModelsURL), "/")
-	if endpoint == "<nil>" || strings.EqualFold(endpoint, "null") {
-		endpoint = ""
-	}
-	if endpoint == "" {
-		endpoint = cfg.BaseURL + "/models"
-	}
+	endpoint := cfg.BaseURL + "/models"
 	if _, err := url.ParseRequestURI(endpoint); err != nil {
 		return nil, fmt.Errorf("invalid models url: %w", err)
 	}

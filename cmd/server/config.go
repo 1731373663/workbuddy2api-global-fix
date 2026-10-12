@@ -161,15 +161,6 @@ type Config struct {
 	ExpiringSoonDur     time.Duration `json:"-"`
 }
 
-// NormalizeProviders removes empty placeholder values emitted by older GUI versions.
-func (c *Config) NormalizeProviders() {
-	for i := range c.Providers {
-		if strings.EqualFold(strings.TrimSpace(c.Providers[i].ModelsURL), "<nil>") || strings.EqualFold(strings.TrimSpace(c.Providers[i].ModelsURL), "null") {
-			c.Providers[i].ModelsURL = ""
-		}
-	}
-}
-
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
@@ -234,7 +225,6 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	applyEnv(c)
-	c.NormalizeProviders()
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
