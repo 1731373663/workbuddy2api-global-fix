@@ -20,6 +20,9 @@ type Config struct {
 	BaseURL string  `json:"base_url"`
 	APIKey  string  `json:"api_key"`
 	Models  []Model `json:"models,omitempty"`
+	// ModelsSet records that a model list was explicitly saved, so an empty
+	// list means "expose no models" instead of "fall back to upstream".
+	ModelsSet bool `json:"models_set,omitempty"`
 	// Protocol selects the upstream API shape: chat_completions (default) or responses.
 	Protocol string `json:"protocol,omitempty"`
 }
@@ -120,7 +123,7 @@ func (c *Client) ConfiguredModels(ctx context.Context, name string) ([]Model, er
 	if !ok {
 		return nil, fmt.Errorf("provider %q not found", name)
 	}
-	if len(cfg.Models) > 0 {
+	if cfg.ModelsSet || cfg.Models != nil {
 		return cfg.Models, nil
 	}
 	return c.listModels(ctx, cfg)
