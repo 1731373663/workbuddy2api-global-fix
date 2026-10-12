@@ -47,13 +47,20 @@ func (h *Handler) providerModelList() []map[string]any {
 			if owned == "" {
 				owned = name
 			}
-			out = append(out, map[string]any{
+			entry := map[string]any{
 				"id":       name + ":" + public,
 				"object":   "model",
 				"created":  int64(1753600000),
 				"owned_by": owned,
 				"provider": name,
-			})
+			}
+			if len(model.Efforts) > 0 {
+				entry["reasoning_supported_efforts"] = append([]string(nil), model.Efforts...)
+				if model.DefaultEffort != "" {
+					entry["reasoning_default_effort"] = model.DefaultEffort
+				}
+			}
+			out = append(out, entry)
 		}
 	}
 	return out

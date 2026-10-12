@@ -33,6 +33,11 @@ type Model struct {
 	ID      string `json:"id"`
 	Name    string `json:"name,omitempty"`
 	OwnedBy string `json:"owned_by,omitempty"`
+	// Efforts/DefaultEffort declare the reasoning levels this upstream model
+	// accepts. Empty means "unknown", in which case reasoning_effort is stripped
+	// before forwarding (many upstreams reject the OpenAI field outright).
+	Efforts       []string `json:"efforts,omitempty"`
+	DefaultEffort string   `json:"default_effort,omitempty"`
 }
 
 // Client forwards chat requests to configured third-party providers.
@@ -271,7 +276,7 @@ func (c *Client) Stream(ctx context.Context, providerName, model string, body []
 		}
 		requestBody = converted
 	} else {
-		rewritten, err := rewriteModel(body, model)
+		rewritten, err := rewriteModelWithEfforts(body, model, declaredEfforts(cfg, model))
 		if err != nil {
 			return nil, 0, nil, err
 		}
@@ -637,12 +642,34 @@ func (c *Client) setHeaders(req *http.Request, cfg Config) {
 	}
 }
 
+// declaredEfforts returns the effort levels declared for a provider model.
+// It matches by upstream id first, then by public display name.
+func declaredEfforts(cfg Config, model string) []string {
+	for _, m := range cfg.Models {
+		if m.ID == model || strings.TrimSpace(m.Name) == model {
+			return m.Efforts
+		}
+	}
+	return nil
+}
+
 func rewriteModel(body []byte, model string) ([]byte, error) {
+	return rewriteModelWithEfforts(body, model, nil)
+}
+
+// rewriteModelWithEfforts rewrites the model field and strips the OpenAI
+// reasoning_effort / reasoningEffort fields. Third-party upstreams vary widely:
+// Claude behind an Anthropic-compatible gateway rejects the OpenAI field with
+// HTTP 400 and expects its own thinking object instead, so the gateway never
+// forwards it. Declared efforts are used only for /v1/models advertisement.
+func rewriteModelWithEfforts(body []byte, model string, efforts []string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, fmt.Errorf("parse request body: %w", err)
 	}
 	obj["model"] = model
+	delete(obj, "reasoning_effort")
+	delete(obj, "reasoningEffort")
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return nil, err
