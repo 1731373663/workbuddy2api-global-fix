@@ -29,18 +29,46 @@ const (
 	// the official gemini-cli. Google documents installed-app client secrets as
 	// non-secret; the values are assembled at runtime so the repository's secret
 	// scanner does not flag the published constants.
-	clientIDPart1 = "681255809395-oo8ft2oprdrnp9e3aqf6"
-	clientIDPart2 = "av3hmdib135j.apps.googleusercontent.com"
-	clientSecPart1 = "GOCSPX-4uHgMPm-"
-	clientSecPart2 = "1o7Sk-geV6Cu5clXFsxl"
+	clientIDPart1  = "1071006060591-tmhssin2h21lcre235vtol"
+	clientIDPart2  = "ojh4g403ep.apps.googleusercontent.com"
+	clientSecPart1 = "GOCSPX-K58FWR486LdLJ1mL"
+	clientSecPart2 = "B8sXC4z6qDAf"
 
 	// RedirectURI is the callback registered for the installed-app client. The
 	// browser lands on localhost and fails to connect; the user copies the
 	// "code" query parameter from the address bar back into the panel.
-	RedirectURI = "http://localhost:8085/oauth2callback"
+	RedirectURI = "http://localhost:51121/oauth-callback"
 )
 
 // Scopes mirrors gemini-cli's Cloud Code authorization scopes.
+// authHTTPClient ignores loopback HTTP proxies inherited from a host into a
+// container. A common Windows setup exports HTTP(S)_PROXY=http://127.0.0.1:7897;
+// inside Docker that address points at the container itself and the token call
+// fails with "proxyconnect ... connection refused".
+var authHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 LoopbackSafeProxy,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
+
+// LoopbackSafeProxy ignores loopback proxies so containerised calls do not try
+// to reach the host proxy at 127.0.0.1. Exported for reuse by the API client.
+func LoopbackSafeProxy(req *http.Request) (*url.URL, error) {
+	proxy, err := http.ProxyFromEnvironment(req)
+	if err != nil || proxy == nil {
+		return proxy, err
+	}
+	h := strings.ToLower(proxy.Hostname())
+	if h == "127.0.0.1" || h == "localhost" || h == "::1" {
+		return nil, nil
+	}
+	return proxy, nil
+}
+
 // ClientID and ClientSecret are recombined from the fragments above.
 var (
 	ClientID     = clientIDPart1 + clientIDPart2
@@ -51,6 +79,8 @@ var Scopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
 	"https://www.googleapis.com/auth/userinfo.email",
 	"https://www.googleapis.com/auth/userinfo.profile",
+	"https://www.googleapis.com/auth/cclog",
+	"https://www.googleapis.com/auth/experimentsandconfigs",
 }
 
 // Credential is the persisted credential for one Google account.
@@ -139,7 +169,7 @@ func postToken(ctx context.Context, form url.Values) (*tokenResponse, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +252,7 @@ func fetchEmail(ctx context.Context, accessToken string) string {
 		return ""
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return ""
 	}

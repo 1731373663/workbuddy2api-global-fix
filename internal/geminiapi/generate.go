@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 )
@@ -52,6 +53,9 @@ func (c *Client) Generate(ctx context.Context, in OpenAIChatRequest) (string, ma
 		return "", nil, err
 	}
 	body := BuildRequest(in, project)
+	if dbg, _ := json.Marshal(body); true {
+		log.Printf("DBG gemini generateContent body: %s", truncate(string(dbg), 600))
+	}
 	resp, err := c.do(ctx, "generateContent", body)
 	if err != nil {
 		return "", nil, err
@@ -83,8 +87,10 @@ type StreamChunk struct {
 }
 
 // GenerateStream calls streamGenerateContent and invokes onChunk for each delta.
-// Code Assist streams SSE frames (`data: {...}`); the envelope mirrors the
-// non-streaming response.
+//
+// Antigravity returns a JSON array stream ("[{...},\n{...}]"); each element holds
+// an incremental candidate delta. A json.Decoder walks the array incrementally so
+// frames are emitted as they arrive without buffering the whole body.
 func (c *Client) GenerateStream(ctx context.Context, in OpenAIChatRequest, onChunk func(StreamChunk) error) error {
 	project, _, err := c.EnsureProject(ctx)
 	if err != nil {
@@ -101,43 +107,36 @@ func (c *Client) GenerateStream(ctx context.Context, in OpenAIChatRequest, onChu
 		return fmt.Errorf("streamGenerateContent HTTP %d: %s", resp.StatusCode, truncate(string(raw), 400))
 	}
 
-	reader := bufio.NewReaderSize(resp.Body, 64*1024)
-	lastLen := 0
-	for {
-		line, err := reader.ReadString('\n')
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if payload != "" && payload != "[DONE]" {
-				var frame CaResponse
-				if json.Unmarshal([]byte(payload), &frame) == nil {
-					full := frame.text()
-					delta := full
-					if len(full) >= lastLen {
-						delta = full[lastLen:]
-					}
-					lastLen = len(full)
-					chunk := StreamChunk{Text: delta}
-					if frame.Response != nil {
-						chunk.PromptTokens = frame.Response.UsageMetadata.PromptTokenCount
-						chunk.OutputTokens = frame.Response.UsageMetadata.CandidatesTokenCount
-						chunk.TotalTokens = frame.Response.UsageMetadata.TotalTokenCount
-					}
-					if delta != "" {
-						if cbErr := onChunk(chunk); cbErr != nil {
-							return cbErr
-						}
-					}
-				}
-			}
+	dec := json.NewDecoder(bufio.NewReaderSize(resp.Body, 64*1024))
+	if _, err := dec.Token(); err != nil {
+		if err == io.EOF {
+			return nil
 		}
-		if err != nil {
+		return err
+	}
+	for dec.More() {
+		var frame CaResponse
+		if err := dec.Decode(&frame); err != nil {
 			if err == io.EOF {
 				return nil
 			}
 			return err
 		}
+		text := frame.text()
+		if text == "" {
+			continue
+		}
+		chunk := StreamChunk{Text: text}
+		if frame.Response != nil {
+			chunk.PromptTokens = frame.Response.UsageMetadata.PromptTokenCount
+			chunk.OutputTokens = frame.Response.UsageMetadata.CandidatesTokenCount
+			chunk.TotalTokens = frame.Response.UsageMetadata.TotalTokenCount
+		}
+		if err := onChunk(chunk); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // Probe verifies the credential by resolving the project (cheap health check).

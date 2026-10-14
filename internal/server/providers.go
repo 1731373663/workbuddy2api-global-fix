@@ -38,10 +38,21 @@ func (h *Handler) providerModelList() []map[string]any {
 			log.Printf("WARN: [provider] list models provider=%s: %v", name, err)
 			continue
 		}
+		nameCount := map[string]int{}
+		for _, model := range list {
+			nm := strings.TrimSpace(model.Name)
+			if nm == "" {
+				nm = model.ID
+			}
+			nameCount[nm]++
+		}
 		for _, model := range list {
 			public := model.ID
 			if strings.TrimSpace(model.Name) != "" {
 				public = model.Name
+				if nameCount[public] > 1 {
+					public = public + " [" + model.ID + "]"
+				}
 			}
 			owned := model.OwnedBy
 			if owned == "" {
@@ -53,6 +64,12 @@ func (h *Handler) providerModelList() []map[string]any {
 				"created":  int64(1753600000),
 				"owned_by": owned,
 				"provider": name,
+			}
+			if model.ContextLength > 0 {
+				entry["context_length"] = model.ContextLength
+			}
+			if model.MaxOutput > 0 {
+				entry["max_output_tokens"] = model.MaxOutput
 			}
 			if len(model.Efforts) > 0 {
 				entry["reasoning_supported_efforts"] = append([]string(nil), model.Efforts...)

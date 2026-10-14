@@ -38,6 +38,9 @@ type Model struct {
 	// before forwarding (many upstreams reject the OpenAI field outright).
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"default_effort,omitempty"`
+	// ContextLength / MaxOutput expose the model window to clients.
+	ContextLength int64 `json:"context_length,omitempty"`
+	MaxOutput     int64 `json:"max_output_tokens,omitempty"`
 }
 
 // Client forwards chat requests to configured third-party providers.
@@ -69,6 +72,11 @@ func New(configs []Config) *Client {
 		cfg.Name = name
 		cfg.BaseURL = base
 		cfg.Protocol = normalizeProtocol(cfg.Protocol)
+		// Gemini Code Assist talks to a fixed Cloud Code endpoint and has no
+		// user-supplied base URL; accept the placeholder.
+		if cfg.Protocol == ProtocolGeminiCodeAssist && cfg.BaseURL == "-" {
+			cfg.BaseURL = ""
+		}
 		c.providers[name] = cfg
 	}
 	return c
@@ -149,7 +157,13 @@ func (c *Client) ResolveModel(providerName, publicName string) string {
 		if m.ID == publicName {
 			return publicName
 		}
-		if strings.TrimSpace(m.Name) == publicName {
+		name := strings.TrimSpace(m.Name)
+		if name == publicName {
+			return m.ID
+		}
+		// The model list disambiguates duplicate display names as
+		// "<name> [<id>]"; accept that form here too.
+		if name != "" && publicName == name+" ["+m.ID+"]" {
 			return m.ID
 		}
 	}
@@ -198,7 +212,7 @@ func (c *Client) ListProviderModels(ctx context.Context, name string) ([]Model, 
 
 func (c *Client) listModels(ctx context.Context, cfg Config) ([]Model, error) {
 	if normalizeProtocol(cfg.Protocol) == ProtocolGeminiCodeAssist {
-		models := listGeminiModels(cfg)
+		models := listGeminiModels(ctx, cfg)
 		if len(models) == 0 {
 			return nil, fmt.Errorf("gemini provider %q returned no models", cfg.Name)
 		}

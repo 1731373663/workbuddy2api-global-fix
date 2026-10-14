@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"workbuddy2api/internal/geminiapi"
@@ -44,7 +45,9 @@ func streamGemini(ctx context.Context, cfg Config, model string, body []byte) (i
 		return nil, 0, nil, fmt.Errorf("parse chat request: %w", err)
 	}
 	if strings.TrimSpace(model) != "" {
-		req.Model = model
+		req.Model = resolveGeminiModelID(ctx, cfg, model)
+	} else {
+		req.Model = resolveGeminiModelID(ctx, cfg, req.Model)
 	}
 
 	if req.Stream {
@@ -105,20 +108,88 @@ func geminiStreamReader(ctx context.Context, client *geminiapi.Client, req gemin
 	return pr
 }
 
-// listGeminiModels returns the model catalogue for a Gemini provider.
-func listGeminiModels(cfg Config) []Model {
+// listGeminiModels returns the model catalogue for a Gemini provider. It prefers
+// the live fetchAvailableModels list and falls back to the static catalogue when
+// the API call fails.
+func listGeminiModels(ctx context.Context, cfg Config) []Model {
 	client, err := geminiClient(cfg)
 	if err != nil {
 		return nil
 	}
-	src := client.Models()
+	src, err := client.FetchModels(ctx)
+	if err != nil || len(src) == 0 {
+		src = client.Models()
+	}
 	out := make([]Model, 0, len(src))
 	for _, m := range src {
 		name := m.DisplayName
 		if name == "" {
 			name = m.ID
 		}
-		out = append(out, Model{ID: m.ID, Name: name, OwnedBy: "google"})
+		out = append(out, Model{ID: m.ID, Name: name, OwnedBy: "google", ContextLength: m.ContextLength, MaxOutput: m.MaxOutput})
 	}
 	return out
+}
+
+// resolveGeminiModelID maps a public display name (e.g. "Gemini 3 Flash") back
+// to the upstream model id. It consults the live model list (cached) so renames
+// are handled, then falls back to the static catalogue. Unknown names pass
+// through unchanged so direct ids keep working.
+func resolveGeminiModelID(ctx context.Context, cfg Config, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return name
+	}
+	models, err := cachedGeminiModels(ctx, cfg)
+	if err == nil {
+		for _, m := range models {
+			if m.ID == name {
+				return name
+			}
+			dn := strings.TrimSpace(m.DisplayName)
+			if dn == name {
+				return m.ID
+			}
+			if dn != "" && name == dn+" ["+m.ID+"]" {
+				return m.ID
+			}
+		}
+	}
+	for _, m := range geminiapi.StaticModels() {
+		if m.ID == name {
+			return name
+		}
+		if m.DisplayName == name {
+			return m.ID
+		}
+	}
+	return name
+}
+
+var geminiModelsCache sync.Map
+
+type geminiModelsCacheEntry struct {
+	models []geminiapi.Model
+	at     time.Time
+}
+
+const geminiModelsCacheTTL = 10 * time.Minute
+
+func cachedGeminiModels(ctx context.Context, cfg Config) ([]geminiapi.Model, error) {
+	if v, ok := geminiModelsCache.Load(cfg.Name); ok {
+		e := v.(geminiModelsCacheEntry)
+		if time.Since(e.at) < geminiModelsCacheTTL {
+			return e.models, nil
+		}
+	}
+	client, err := geminiClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	models, err := client.FetchModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	geminiModelsCache.Store(cfg.Name, geminiModelsCacheEntry{models: models, at: time.Now()})
+	return models, nil
 }
