@@ -197,6 +197,13 @@ func (c *Client) ListProviderModels(ctx context.Context, name string) ([]Model, 
 }
 
 func (c *Client) listModels(ctx context.Context, cfg Config) ([]Model, error) {
+	if normalizeProtocol(cfg.Protocol) == ProtocolGeminiCodeAssist {
+		models := listGeminiModels(cfg)
+		if len(models) == 0 {
+			return nil, fmt.Errorf("gemini provider %q returned no models", cfg.Name)
+		}
+		return models, nil
+	}
 	endpoint := cfg.BaseURL + "/models"
 	if _, err := url.ParseRequestURI(endpoint); err != nil {
 		return nil, fmt.Errorf("invalid models url: %w", err)
@@ -266,6 +273,9 @@ func (c *Client) Stream(ctx context.Context, providerName, model string, body []
 		return nil, 0, nil, fmt.Errorf("provider %q not found", providerName)
 	}
 	protocol := normalizeProtocol(cfg.Protocol)
+	if protocol == ProtocolGeminiCodeAssist {
+		return streamGemini(ctx, cfg, model, body)
+	}
 	endpoint := cfg.BaseURL + "/chat/completions"
 	requestBody := body
 	if protocol == "responses" {
@@ -617,6 +627,8 @@ func normalizeProtocol(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "responses", "response", "responses_api", "openai_responses":
 		return "responses"
+	case "gemini_code_assist", "gemini", "code_assist", "google_gemini":
+		return ProtocolGeminiCodeAssist
 	default:
 		return "chat_completions"
 	}
