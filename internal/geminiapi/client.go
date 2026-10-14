@@ -282,11 +282,12 @@ func (c *Client) FetchModels(ctx context.Context) ([]Model, error) {
 	}
 	out := make([]Model, 0, len(env.Models))
 	for id, m := range env.Models {
-		name := strings.TrimSpace(m.DisplayName)
-		if name == "" || strings.HasPrefix(id, "tab_") || strings.HasPrefix(id, "chat_") {
+		// Skip upstream-internal entries; keep real models even when they have no
+		// display name yet (the provider layer fills one in).
+		if strings.HasPrefix(id, "tab_") || strings.HasPrefix(id, "chat_") {
 			continue
 		}
-		out = append(out, Model{ID: id, DisplayName: name, ContextLength: m.MaxTokens, MaxOutput: m.MaxOutputTokens})
+		out = append(out, Model{ID: id, DisplayName: strings.TrimSpace(m.DisplayName), ContextLength: m.MaxTokens, MaxOutput: m.MaxOutputTokens})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("fetchAvailableModels returned no usable models")

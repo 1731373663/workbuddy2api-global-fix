@@ -108,6 +108,22 @@ func geminiStreamReader(ctx context.Context, client *geminiapi.Client, req gemin
 	return pr
 }
 
+// geminiNameOverrides supplies display names for upstream ids that come back
+// without one, so they are still selectable in the model picker.
+var geminiNameOverrides = map[string]string{
+	"gemini-3.8-flash-tiered": "Gemini 3.8 Flash",
+	"gemini-2.5-pro":          "Gemini 2.5 Pro",
+}
+
+// geminiRetired lists ids the upstream still advertises but now rejects with
+// "no longer available"; they are hidden so the picker only shows usable models.
+var geminiRetired = map[string]bool{
+	"gemini-3-flash-agent":       true,
+	"gemini-3.5-flash-low":       true,
+	"gemini-3.5-flash-extra-low": true,
+	"gemini-2.5-flash-thinking":  true,
+}
+
 // listGeminiModels returns the model catalogue for a Gemini provider. It prefers
 // the live fetchAvailableModels list and falls back to the static catalogue when
 // the API call fails.
@@ -122,7 +138,13 @@ func listGeminiModels(ctx context.Context, cfg Config) []Model {
 	}
 	out := make([]Model, 0, len(src))
 	for _, m := range src {
-		name := m.DisplayName
+		if geminiRetired[m.ID] {
+			continue
+		}
+		name := strings.TrimSpace(m.DisplayName)
+		if name == "" {
+			name = geminiNameOverrides[m.ID]
+		}
 		if name == "" {
 			name = m.ID
 		}
@@ -147,6 +169,9 @@ func resolveGeminiModelID(ctx context.Context, cfg Config, name string) string {
 				return name
 			}
 			dn := strings.TrimSpace(m.DisplayName)
+			if dn == "" {
+				dn = geminiNameOverrides[m.ID]
+			}
 			if dn == name {
 				return m.ID
 			}
