@@ -90,6 +90,35 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
+// ReviveAccount clears both the cooldown and the breaker once the upstream
+// confirms the account still has credits. A transient upstream "insufficient
+// credits" reply can first cool an account and then trip the breaker, leaving a
+// healthy account out of the pool until the breaker expires on its own. This is
+// the manual revive path: the operator has re-validated the live balance, so the
+// breaker is reset too. remain <= 0 only refreshes the cached credit value.
+func (p *Pool) ReviveAccount(uid string, remain int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	if remain <= 0 || e.disabled {
+		e.credits = remain
+		p.dirty.Store(true)
+		return false
+	}
+	p.reviveCoolingLocked(e, remain)
+	e.fails = 0
+	e.retryCount = 0
+	e.breakerUntil = time.Time{}
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
+	e.sessionDeadFails = 0
+	p.dirty.Store(true)
+	return true
+}
+
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal，
 // 并拉高 errorEMA（成功率权重的衰减口径）。达到 breakerThreshold 触发熔断（指数
 // 退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。

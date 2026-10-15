@@ -125,6 +125,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/account-models", h.withAuth(h.accountModels))
 	h.mux.HandleFunc("GET /v1/account-models/{uid}", h.withAuth(h.accountModels))
 	h.mux.HandleFunc("PUT /v1/account-models/{uid}", h.withAuth(h.accountModelSettingsPut))
+	h.mux.HandleFunc("POST /v1/accounts/{uid}/revive", h.withAuth(h.reviveAccount))
 	// 请求统计：所有经本网关的请求（含绕过面板的客户端）按模型聚合。
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("GET /v1/stats/details", h.withAuth(h.statsDetails))
