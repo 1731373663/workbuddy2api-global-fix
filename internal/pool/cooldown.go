@@ -174,7 +174,6 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
-
 // ClearSameModelSoftRate 在同一模型经真实请求成功后，清除由该模型 6004 途径
 // 产生的账号级软限流冷却（coolKind=CoolSoft 且 reason 前缀为 429 rate limit）。
 // 只处理软限流；硬冷却、WAF、熔断与其他模型条目均保留。用于 /console 收到 6004
@@ -195,7 +194,6 @@ func (p *Pool) ClearSameModelSoftRate(uid string) {
 	e.softStreak = 0
 	p.dirty.Store(true)
 }
-
 
 // NoteModelSuccess 记录 (账号, 模型) 的真实成功：只清除该模型在 modelCooldowns
 // 中的条目（无论 6004 还是 11102），其他模型条目保持不动。6004 的上游重置墙钟
